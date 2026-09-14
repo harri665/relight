@@ -1,11 +1,14 @@
 {
-  "name": "HarrisonDefaultTemplate",
+  "name": "relight",
   "private": true,
   "version": "0.1.0",
   "scripts": {
     "dev": "concurrently \"npm run dev --prefix server\" \"npm run dev --prefix client\"",
     "client": "npm run dev --prefix client",
     "server": "npm run dev --prefix server",
+    "lan": "concurrently \"npm run dev --prefix server\" \"npm run dev:lan --prefix client\"",
+    "https": "concurrently \"npm run dev --prefix server\" \"npm run dev:https --prefix client\"",
+    "build": "npm run build --prefix client",
     "install:all": "concurrently \"npm install --prefix client\" \"npm install --prefix server\""
   },
   "devDependencies": {
