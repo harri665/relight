@@ -1,28 +1,37 @@
-import { useEffect, useState } from 'react'
+import { useRelighter } from '../relight/useRelighter.js'
+import Viewport from '../components/Viewport.jsx'
+import LightsPanel from '../components/panels/LightsPanel.jsx'
+
+const TABS = [
+  { id: 'lights', label: 'Lights', Panel: LightsPanel },
+]
 
 export default function Home() {
-  const [health, setHealth] = useState(null)
-  const [error, setError] = useState(null)
-
-  useEffect(() => {
-    fetch('/api/health')
-      .then((r) => r.json())
-      .then(setHealth)
-      .catch((e) => setError(e.message))
-  }, [])
-
+  const r = useRelighter()
+  const { tab } = r.state
+  const Panel = TABS.find((t) => t.id === tab).Panel
   return (
-    <section className="p-6 space-y-4">
-      <h1 className="text-4xl font-bold">Home</h1>
-      <div className="rounded border p-4">
-        <h2 className="font-semibold mb-2">API Health</h2>
-        {error && <p className="text-red-600">Error: {error}</p>}
-        {health ? (
-          <pre className="text-sm bg-gray-100 p-2 rounded">{JSON.stringify(health, null, 2)}</pre>
-        ) : (
-          <p className="text-gray-600">Loading...</p>
-        )}
-      </div>
-    </section>
+    <main className="grid min-h-0 flex-1 grid-cols-[1fr_340px] max-[800px]:grid-cols-1">
+      <Viewport />
+      <aside className="overflow-y-auto border-l border-line bg-panel max-[800px]:border-t max-[800px]:border-l-0">
+        <nav className="sticky top-0 z-10 flex border-b border-line bg-panel" role="tablist">
+          {TABS.map((t) => (
+            <button
+              key={t.id}
+              type="button"
+              role="tab"
+              aria-selected={t.id === tab}
+              className={`flex-1 cursor-pointer whitespace-nowrap px-1 py-2 text-xs ${t.id === tab ? 'text-fg shadow-[inset_0_-2px_var(--color-accent)]' : 'text-dim hover:text-fg'}`}
+              onClick={() => r.setTab(t.id)}
+            >
+              {t.label}
+            </button>
+          ))}
+        </nav>
+        <div className="px-4 py-3">
+          {r.ready ? <Panel /> : <p className="text-dim">{r.status.phase === 'error' ? 'The viewer could not start.' : 'Loading…'}</p>}
+        </div>
+      </aside>
+    </main>
   )
 }

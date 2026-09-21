@@ -1,10 +1,26 @@
 @import "tailwindcss";
 
-/* Optional: base layout */
+@theme {
+  --color-bg: #111;
+  --color-panel: #1a1a1a;
+  --color-line: #333;
+  --color-fg: #ddd;
+  --color-dim: #888;
+  --color-accent: #fa4;
+  --color-danger: #f65;
+}
+
 html, body, #root {
   height: 100%;
 }
 body {
-  background-color: #f9fafb;
-  color: #111827;
+  background-color: var(--color-bg);
+  color: var(--color-fg);
+  font: 14px/1.4 system-ui, sans-serif;
+  accent-color: var(--color-accent);
+  color-scheme: dark;
+}
+input[type=range] {
+  width: 100%;
+  margin: 0;
 }
