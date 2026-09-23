@@ -1,9 +1,11 @@
 import { useRelighter } from '../relight/useRelighter.js'
 import Viewport from '../components/Viewport.jsx'
 import LightsPanel from '../components/panels/LightsPanel.jsx'
+import PaintPanel from '../components/panels/PaintPanel.jsx'
 
 const TABS = [
   { id: 'lights', label: 'Lights', Panel: LightsPanel },
+  { id: 'paint', label: 'Paint & Optimize', Panel: PaintPanel },
 ]
 
 export default function Home() {
