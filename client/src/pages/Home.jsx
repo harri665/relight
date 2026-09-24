@@ -2,10 +2,12 @@ import { useRelighter } from '../relight/useRelighter.js'
 import Viewport from '../components/Viewport.jsx'
 import LightsPanel from '../components/panels/LightsPanel.jsx'
 import PaintPanel from '../components/panels/PaintPanel.jsx'
+import AccuracyPanel from '../components/panels/AccuracyPanel.jsx'
 
 const TABS = [
   { id: 'lights', label: 'Lights', Panel: LightsPanel },
   { id: 'paint', label: 'Paint & Optimize', Panel: PaintPanel },
+  { id: 'compare', label: 'Accuracy', Panel: AccuracyPanel },
 ]
 
 export default function Home() {
