@@ -1,7 +1,13 @@
 import { useEffect, useState } from 'react'
 import { useRelighter } from '../relight/useRelighter.js'
-import { SCENE } from '../relight/relighter.js'
+import { SCENE, BACKEND } from '../relight/relighter.js'
 import { fmt } from '../relight/color.js'
+import { Segmented } from './ui.jsx'
+
+const hasWebGPU = !!navigator.gpu
+const hasWebGL2 = (() => {
+  try { return !!document.createElement('canvas').getContext('webgl2') } catch { return false }
+})()
 
 function useSceneIndex() {
   const [scenes, setScenes] = useState([])
@@ -19,8 +25,17 @@ const SELECT = 'rounded border border-line bg-[#222] px-1.5 py-0.5 text-xs text-
 export default function StatsBar() {
   const r = useRelighter()
   const scenes = useSceneIndex()
+  const want = (BACKEND || '').toLowerCase()
+  const backends = [
+    { value: '', label: r.engine && !want ? `Auto (${r.engine.backend})` : 'Auto' },
+    { value: 'webgpu', label: 'WebGPU', disabled: !hasWebGPU, title: hasWebGPU ? undefined : 'WebGPU is not available in this browser' },
+    { value: 'webgl', label: 'WebGL2', disabled: !hasWebGL2, title: hasWebGL2 ? undefined : 'WebGL2 is not available in this browser' },
+  ]
   return (
     <div className="flex flex-wrap items-center gap-4 text-xs text-dim">
+      <span title="Rendering backend (reloads, keeps your lights)">
+        <Segmented options={backends} value={want} onChange={(b) => b !== want && r.reloadWith({ backend: b })} />
+      </span>
       {scenes.length > 1 && (
         <select title="model" className={SELECT} value={SCENE} onChange={(e) => r.reloadWith({ scene: e.target.value })}>
           {scenes.map((s) => <option key={s.name} value={s.name}>{s.label}</option>)}

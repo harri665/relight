@@ -3,6 +3,7 @@ import { makeShaders } from "./shaders.js";
 import { EngineBase, MAX_LIGHTS } from "./engine-base.js";
 
 export { MAX_LIGHTS };
+export { GLEngine } from "./nrp-gl.js";
 
 const sigmoid = (x) => 1 / (1 + Math.exp(-x));
 

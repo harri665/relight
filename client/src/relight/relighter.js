@@ -1,7 +1,7 @@
 // The viewer's runtime: owns the engine, the lights, the render loop and the viewport canvases.
 // React components read its fields directly and re-render on emit() (see useRelighter.js).
 // It lives for the whole page load, so leaving the viewer route does not reload the scene.
-import { NRPEngine, LightOptimizer, MAX_LIGHTS, discPixels } from "../engine/nrp.js";
+import { NRPEngine, GLEngine, LightOptimizer, MAX_LIGHTS, discPixels } from "../engine/nrp.js";
 import { hexToRgb, rgbToHex, srgbToLin, fmt } from "./color.js";
 
 const params = new URLSearchParams(location.search);
@@ -102,7 +102,7 @@ class Relighter {
   /** WebGPU first, then WebGL2. Returns the first backend that loads the scene. */
   async startEngine(setMsg) {
     const failed = [];
-    for (const [name, Engine] of [["WebGPU", NRPEngine]]) {
+    for (const [name, Engine] of [["WebGPU", NRPEngine], ["WebGL2", GLEngine]]) {
       if (BACKEND && !name.toLowerCase().startsWith(BACKEND.toLowerCase())) continue;
       let e;
       try {
@@ -131,7 +131,7 @@ class Relighter {
       console.error(e);
       this.status = {
         phase: "error",
-        message: `${e.message}\n\nThis demo needs a browser with WebGPU.`,
+        message: `${e.message}\n\nThis demo needs a browser with WebGPU, or WebGL2 with floating-point render targets.`,
       };
       this.emit();
       return;
