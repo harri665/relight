@@ -3,11 +3,13 @@ import Viewport from '../components/Viewport.jsx'
 import LightsPanel from '../components/panels/LightsPanel.jsx'
 import PaintPanel from '../components/panels/PaintPanel.jsx'
 import AccuracyPanel from '../components/panels/AccuracyPanel.jsx'
+import ModelPanel from '../components/panels/ModelPanel.jsx'
 
 const TABS = [
   { id: 'lights', label: 'Lights', Panel: LightsPanel },
   { id: 'paint', label: 'Paint & Optimize', Panel: PaintPanel },
   { id: 'compare', label: 'Accuracy', Panel: AccuracyPanel },
+  { id: 'model', label: 'Model', Panel: ModelPanel },
 ]
 
 export default function Home() {
