@@ -240,9 +240,9 @@ export class GLEngine extends EngineBase {
     return e;
   }
 
-  async load(base, onProgress = () => {}) {
+  async load(base, onProgress = () => {}, res = null) {
     const gl = this.gl;
-    const { scene, grid, gridOff, layers, aux } = await this.fetchScene(base, onProgress);
+    const { scene, grid, gridOff, layers, aux } = await this.fetchScene(base, onProgress, res);
     const { W, H, NP } = this;
     const net = scene.network;
     const WD = net.width, NH = net.hidden - 1, G = WD / 4;

@@ -34,9 +34,9 @@ export class NRPEngine extends EngineBase {
     return e;
   }
 
-  async load(base, onProgress = () => {}) {
+  async load(base, onProgress = () => {}, res = null) {
     const dev = this.device;
-    const { scene, grid, gridOff, layers, aux } = await this.fetchScene(base, onProgress);
+    const { scene, grid, gridOff, layers, aux } = await this.fetchScene(base, onProgress, res);
     const { W, H, NP } = this;
     const net = scene.network;
     const WD = net.width, NH = net.hidden - 1;

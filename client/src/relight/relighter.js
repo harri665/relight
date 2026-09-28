@@ -7,6 +7,7 @@ import { hexToRgb, rgbToHex, srgbToLin, fmt } from "./color.js";
 const params = new URLSearchParams(location.search);
 export const SCENE = params.get("scene") || "cornell";
 export const BACKEND = params.get("backend");  // "webgpu" or "webgl" forces one
+export const RES = Number(params.get("res")) || null;  // alternative image size, see export.py --res
 export { MAX_LIGHTS };
 
 // While lights change, a light whose full-resolution evaluation would not fit the frame budget is
@@ -108,7 +109,7 @@ class Relighter {
       try {
         setMsg(`starting ${name}…`);
         e = await Engine.create(this.gpuCanvas);
-        const sc = await e.load(`/scenes/${SCENE}`, (m) => setMsg(`loading ${m} (${name})…`));
+        const sc = await e.load(`/scenes/${SCENE}`, (m) => setMsg(`loading ${m} (${name})…`), RES);
         return [e, sc];
       } catch (err) {
         console.warn(`${name} failed:`, err);

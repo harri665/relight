@@ -25,20 +25,29 @@ export function typed(buf, entry) {
  * row-major) in the light's output slot, and the composite upsamples it along the geometry.
  */
 export class EngineBase {
-  /** Fetches and unpacks the scene; returns the raw pieces the backend uploads. */
-  async fetchScene(base, onProgress) {
+  /**
+   * Fetches and unpacks the scene; returns the raw pieces the backend uploads. `res` picks an
+   * alternative image size exported with `export.py --res N` (scene-N.json / pixels-N.bin).
+   */
+  async fetchScene(base, onProgress, res = null) {
+    const suffix = res ? `-${res}` : "";
     const fetchBin = async (f) => {
       const r = await fetch(`${base}/${f}`);
       if (!r.ok) throw new Error(`failed to load ${f}`);
       return r.arrayBuffer();
     };
     onProgress("scene description");
-    const scene = await (await fetch(`${base}/scene.json`)).json();
+    const sr = await fetch(`${base}/scene${suffix}.json`);
+    if (!sr.ok) throw new Error(`failed to load scene${suffix}.json`);
+    const scene = await sr.json();
     this.scene = scene;
     onProgress("network weights");
-    const [model, pixels] = await Promise.all([fetchBin("model.bin"), fetchBin("pixels.bin")]);
+    const [model, pixels] = await Promise.all([fetchBin("model.bin"), fetchBin(`pixels${suffix}.bin`)]);
     this.refsBuf = null;
-    this.refsPromise = fetchBin("refs.bin").then((b) => (this.refsBuf = b)).catch(() => null);
+    // Reference renders exist only at the resolution the paths were traced at.
+    this.refsPromise = scene.refs.length
+      ? fetchBin("refs.bin").then((b) => (this.refsBuf = b)).catch(() => null)
+      : Promise.resolve(null);
 
     const W = scene.width, H = scene.height, NP = W * H;
     this.W = W; this.H = H; this.NP = NP;

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useRelighter } from '../relight/useRelighter.js'
-import { SCENE, BACKEND } from '../relight/relighter.js'
+import { SCENE, BACKEND, RES } from '../relight/relighter.js'
 import { fmt } from '../relight/color.js'
 import { Segmented } from './ui.jsx'
 
@@ -25,6 +25,7 @@ const SELECT = 'rounded border border-line bg-[#222] px-1.5 py-0.5 text-xs text-
 export default function StatsBar() {
   const r = useRelighter()
   const scenes = useSceneIndex()
+  const tiers = scenes.find((s) => s.name === SCENE)?.tiers ?? []
   const want = (BACKEND || '').toLowerCase()
   const backends = [
     { value: '', label: r.engine && !want ? `Auto (${r.engine.backend})` : 'Auto' },
@@ -37,8 +38,14 @@ export default function StatsBar() {
         <Segmented options={backends} value={want} onChange={(b) => b !== want && r.reloadWith({ backend: b })} />
       </span>
       {scenes.length > 1 && (
-        <select title="model" className={SELECT} value={SCENE} onChange={(e) => r.reloadWith({ scene: e.target.value })}>
+        <select title="model" className={SELECT} value={SCENE} onChange={(e) => r.reloadWith({ scene: e.target.value, res: null })}>
           {scenes.map((s) => <option key={s.name} value={s.name}>{s.label}</option>)}
+        </select>
+      )}
+      {tiers.length > 0 && (
+        <select title="image size (smaller is faster on weak GPUs)" className={SELECT} value={RES ?? ''} onChange={(e) => r.reloadWith({ res: e.target.value })}>
+          <option value="">native size</option>
+          {tiers.map((t) => <option key={t} value={t}>{t} × {t}</option>)}
         </select>
       )}
       <span><b className="font-normal text-fg">{r.stats.fps ?? '–'}</b> fps</span>
