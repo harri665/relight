@@ -5,7 +5,7 @@ services:
       dockerfile: Dockerfile
     container_name: relight-server
     ports:
-      - "3001:3001"
+      - "54891:3001"
     environment:
       - NODE_ENV=production
       - PORT=3001
@@ -25,7 +25,7 @@ services:
       dockerfile: Dockerfile
     container_name: relight-client
     ports:
-      - "80:80"
+      - "54890:80"
     depends_on:
       - server
     networks:
