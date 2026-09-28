@@ -11,7 +11,7 @@ function LossPlot({ history, version }) {
     if (history.length < 2) return
     const lg = history.map((v) => Math.log10(Math.max(v, 1e-12)))
     const mn = Math.min(...lg), mx = Math.max(...lg), pad = 10
-    x.strokeStyle = '#ffb44d'; x.lineWidth = 2; x.beginPath()
+    x.strokeStyle = '#2563eb'; x.lineWidth = 2; x.beginPath()
     lg.forEach((v, i) => {
       const px = pad + ((c.width - 2 * pad) * i) / (lg.length - 1)
       const py = pad + (c.height - 2 * pad) * (1 - (v - mn) / Math.max(1e-6, mx - mn))
@@ -19,7 +19,7 @@ function LossPlot({ history, version }) {
       else x.moveTo(px, py)
     })
     x.stroke()
-    x.fillStyle = '#8d918f'; x.font = '20px ui-monospace, monospace'
+    x.fillStyle = '#6b7280'; x.font = '20px ui-monospace, monospace'
     x.fillText('loss (log)', pad + 4, c.height - pad - 4)
   }, [history, history.length, version])
   return <canvas ref={ref} width={600} height={110} className="mt-2 h-[70px] w-full border border-line" />

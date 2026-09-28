@@ -20,7 +20,7 @@ function useSceneIndex() {
   return scenes
 }
 
-const SELECT = 'rounded border border-line bg-[#222] px-1.5 py-0.5 text-xs text-fg'
+const SELECT = 'rounded border border-line bg-[#f3f4f6] px-1.5 py-0.5 text-xs text-fg'
 
 export default function StatsBar() {
   const r = useRelighter()

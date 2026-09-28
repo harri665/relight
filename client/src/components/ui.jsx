@@ -1,9 +1,9 @@
 const BUTTON = {
-  default: 'border-line bg-[#222] enabled:hover:border-dim',
-  primary: 'border-accent bg-accent text-black font-medium',
-  danger: 'border-danger bg-danger text-black font-medium',
+  default: 'border-line bg-[#f3f4f6] enabled:hover:border-dim',
+  primary: 'border-accent bg-accent text-white font-medium',
+  danger: 'border-danger bg-danger text-white font-medium',
   ghost: 'border-line bg-transparent enabled:hover:border-dim',
-  active: 'border-accent bg-[#222] text-accent',
+  active: 'border-accent bg-[#dbeafe] text-accent',
 }
 
 export function Button({ variant = 'default', small, joined, className = '', ...props }) {
