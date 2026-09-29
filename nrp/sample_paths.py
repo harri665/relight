@@ -11,6 +11,9 @@ Output layout (structure-of-arrays, fp16, path index = pixel * spp + sample):
     thr.npy    [D,   3, P*S]
     aux.npy    [H, W, 10]  albedo(3) normal(3) position(3) distance(1)
     meta.json
+
+--scene takes a built-in scene name or a USD file (see usd_scene.py); a USD scene's dump goes to
+cache/<file stem or --name>/ and later steps use that id as their --scene.
 """
 import argparse
 import json
@@ -52,7 +55,9 @@ def trace_chunk(scene, sensor, res, k, seed, max_seg):
     verts, thr = [to_np(prev)], []
     for _ in range(max_seg):
         si = scene.ray_intersect(ray, active)
-        hit = active & si.is_valid()
+        # Hits beyond FAR count as escapes: light from there is negligible for lights near the
+        # scene, and it keeps vertices within fp16 range for stages with huge ground planes.
+        hit = active & si.is_valid() & (si.t < FAR)
         end = dr.select(hit, si.p, dr.select(active, ray.o + ray.d * FAR, prev))
         seg_T = dr.select(active, T, 0.0)
         bsdf = si.bsdf(ray)
@@ -68,31 +73,83 @@ def trace_chunk(scene, sensor, res, k, seed, max_seg):
     return np.stack(verts), np.stack(thr)  # [D+1,3,n], [D,3,n]
 
 
-def render_aux(scene, spp):
-    integ = mi.load_dict({"type": "aov", "aovs": "albedo:albedo,nn:sh_normal,pp:position,dd:depth"})
-    img = np.array(mi.render(scene, integrator=integ, spp=spp))
-    names = integ.aov_names()
-    # The aov integrator prepends RGB channels from its (empty) inner integrator.
-    off = img.shape[-1] - len(names)
-    ch = {n: off + i for i, n in enumerate(names)}
-    pick = lambda pre: img[..., [ch[n] for n in names if n.startswith(pre + ".")]]
-    return pick("albedo"), pick("nn"), pick("pp"), pick("dd")
+def render_aux(scene, spp, chunk=16):
+    """Per-pixel albedo, shading normal, position and camera distance (box-filtered over spp).
+    Like Mitsuba's aov integrator, but it looks through pass-through (null) interactions such as
+    alpha cutouts, so leaves and fences get the aux values of whatever is visible through them."""
+    sensor = scene.sensors()[0]
+    W, H = sensor.film().crop_size()
+    ctx = mi.BSDFContext()
+    acc = np.zeros((H * W, 10))
+    for s0 in range(0, spp, chunk):
+        k = min(chunk, spp - s0)
+        n = W * H * k
+        sampler = mi.load_dict({"type": "independent"})
+        sampler.seed(77 + s0, n)
+        pix = dr.arange(mi.UInt32, n) // k
+        px = mi.Point2f(mi.Float(pix % W), mi.Float(pix // W))
+        ray, _ = sensor.sample_ray(0.0, sampler.next_1d(), (px + sampler.next_2d()) / mi.ScalarVector2f(W, H),
+                                   sampler.next_2d())
+        o = mi.Point3f(ray.o)
+        albedo, normal, pos = mi.Color3f(0.0), mi.Vector3f(0.0), mi.Point3f(0.0)
+        dist = mi.Float(0.0)
+        active = dr.full(mi.Bool, True, n)
+        for _ in range(16):
+            si = scene.ray_intersect(ray, active)
+            hit = active & si.is_valid()
+            bsdf = si.bsdf(ray)
+            bs, _ = bsdf.sample(ctx, si, sampler.next_1d(hit), sampler.next_2d(hit), hit)
+            through = hit & mi.has_flag(bs.sampled_type, mi.BSDFFlags.Null)
+            done = hit & ~through
+            albedo = dr.select(done, bsdf.eval_diffuse_reflectance(si, done), albedo)
+            normal = dr.select(done, si.sh_frame.n, normal)
+            pos = dr.select(done, si.p, pos)
+            dist = dr.select(done, dr.norm(si.p - o), dist)
+            active = through
+            ray = si.spawn_ray(ray.d)
+            sampler.schedule_state()
+            dr.eval(albedo, normal, pos, dist, active, ray)
+            if not dr.any(active):
+                break
+        a = np.concatenate([to_np(albedo).T, to_np(normal).T, to_np(pos).T, np.array(dist)[:, None]], 1)
+        acc += a.reshape(H * W, k, 10).sum(1)
+    img = (acc / spp).reshape(H, W, 10)
+    return img[..., 0:3], img[..., 3:6], img[..., 6:9], img[..., 9:10]
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--scene", default="cornell")
+    ap.add_argument("--scene", default="cornell", help="built-in scene name or USD file")
+    ap.add_argument("--name", default=None, help="id for a USD scene (default: file name without extension)")
+    ap.add_argument("--camera", default=None, help="USD: camera prim path (default: the first camera)")
+    ap.add_argument("--time", type=float, default=None, help="USD: time code (default: start of the stage)")
+    ap.add_argument("--light-bbox", type=float, nargs=6, default=None, metavar=("X0", "Y0", "Z0", "X1", "Y1", "Z1"),
+                    help="USD: light domain in normalised coordinates (default: from what the camera sees)")
+    ap.add_argument("--light-margin", type=float, default=None,
+                    help="USD: grow the default light domain by this much (default: 0.3 open, -0.03 enclosed)")
+    ap.add_argument("--radius-range", type=float, nargs=2, default=None, help="USD: light radius range")
+    ap.add_argument("--max-texture", type=int, default=2048, help="USD: downsample larger textures")
     ap.add_argument("--res", type=int, default=512)
     ap.add_argument("--spp", type=int, default=128)
     ap.add_argument("--max-seg", type=int, default=6)
     ap.add_argument("--chunk", type=int, default=16, help="spp traced per launch")
     args = ap.parse_args()
+    if args.spp & (args.spp - 1):
+        ap.error("--spp must be a power of two (the gather kernel sums each pixel's samples as a block)")
 
-    scene, cfg = scenes.load(args.scene, args.res)
+    name = scenes.scene_id(args.scene, args.name)
+    usd = {}
+    if scenes.is_usd(args.scene):
+        usd = dict(name=name, camera=args.camera, time=args.time, max_texture=args.max_texture,
+                   light_margin=args.light_margin, radius_range=args.radius_range,
+                   light_bbox=[args.light_bbox[:3], args.light_bbox[3:]] if args.light_bbox else None)
+        print(f"importing {args.scene} as '{name}'")
+    scene, cfg = scenes.load(args.scene, args.res, **usd)
     sensor = scene.sensors()[0]
     W = H = args.res
     P, S, D = W * H, args.spp, args.max_seg
-    out = scene_dir(args.scene)
+    out = scene_dir(name)
+    print(f"light domain {cfg['light_bbox']}, radius {cfg['radius_range']}")
 
     t0 = time.time()
     verts = np.lib.format.open_memmap(out / "verts.npy", "w+", np.float16, (D + 1, 3, P, S))
@@ -112,7 +169,7 @@ def main():
 
     params = mi.traverse(sensor)
     meta = {
-        "scene": args.scene, "width": W, "height": H, "spp": S, "max_seg": D, "far": FAR,
+        "scene": name, "width": W, "height": H, "spp": S, "max_seg": D, "far": FAR,
         "camera": {
             "to_world": np.array(sensor.world_transform().matrix).reshape(4, 4).tolist(),
             "fov": float(params["x_fov"][0]) if "x_fov" in params else 39.3077,
@@ -120,6 +177,7 @@ def main():
         },
         "light_bbox": cfg["light_bbox"],
         "radius_range": cfg["radius_range"],
+        **{k: cfg[k] for k in ("source", "normalize", "test_lights", "default_lights") if k in cfg},
     }
     (out / "meta.json").write_text(json.dumps(meta, indent=1))
     print(f"done in {time.time() - t0:.1f}s -> {out}")

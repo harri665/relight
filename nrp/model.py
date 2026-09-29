@@ -129,7 +129,7 @@ class PixelBuffers:
         self.nrm = aux[..., 3:6].reshape(-1, 3)
         self.valid = (aux[..., 9] > 0).reshape(-1, 1).float()
         albedo = aux[..., 0:3].clamp(0, 1).reshape(-1, 3)
-        depth = (aux[..., 9:10] / meta["depth_scale"]).reshape(-1, 1)
+        depth = (aux[..., 9:10] / meta["depth_scale"]).clamp(max=1).reshape(-1, 1)
         feats = [albedo, self.nrm, depth]
         if aux_dim == 10:
             feats.append(self.norm.position(self.pos) * self.valid)

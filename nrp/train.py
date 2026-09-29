@@ -141,7 +141,8 @@ def main():
     pd = PathData(args.scene)
     meta = dict(pd.meta)
     H, W, NP = pd.H, pd.W, pd.NP
-    meta["depth_scale"] = float(pd.aux[..., 9].max())
+    # Capped so a far horizon does not squash the depth input of the actual scene.
+    meta["depth_scale"] = min(float(pd.aux[..., 9].max()), meta.get("far", 40.0))
     bufs = PixelBuffers(pd.aux, meta, aux_dim=10 if args.aux_pos else 7)
     if args.no_aux:
         bufs.aux = torch.zeros_like(bufs.aux)
