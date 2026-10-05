@@ -5,6 +5,36 @@ import { EngineBase, MAX_LIGHTS } from "./engine-base.js";
 export { MAX_LIGHTS };
 export { GLEngine } from "./nrp-gl.js";
 
+// Shapes of the display kernel (shaders.js fastForward): threads in a workgroup, and pixels each
+// thread computes. More pixels per thread reuse each weight more often, for more registers; which
+// is fastest depends on the GPU, so load() times them (tune). `?kernel=128x4` forces one.
+export const KERNELS = [
+  { threads: 256, pixels: 4 }, { threads: 128, pixels: 4 }, { threads: 256, pixels: 8 },
+  { threads: 128, pixels: 8 }, { threads: 64, pixels: 8 }, { threads: 64, pixels: 4 },
+];
+export const kernelKey = (k) => `${k.threads}x${k.pixels}`;
+
+// float32 -> float16 bits, rounded to nearest even
+function toHalf(values) {
+  const out = new Uint16Array(values.length);
+  const f = new Float32Array(1), bits = new Uint32Array(f.buffer);
+  for (let k = 0; k < values.length; k++) {
+    f[0] = values[k];
+    const x = bits[0], sign = (x >>> 16) & 0x8000, e = ((x >>> 23) & 0xff) - 112;
+    let m = x & 0x7fffff;
+    if (e <= 0) out[k] = e < -10 ? sign : sign | ((m | 0x800000) >> (14 - e));
+    else if (e >= 31) out[k] = sign | 0x7c00;
+    else {
+      const rest = m & 0x1fff;
+      m >>= 13;
+      let h = sign | (e << 10) | m;
+      if (rest > 0x1000 || (rest === 0x1000 && m & 1)) h += 1;
+      out[k] = h;
+    }
+  }
+  return out;
+}
+
 const sigmoid = (x) => 1 / (1 + Math.exp(-x));
 
 export class NRPEngine extends EngineBase {
@@ -14,7 +44,9 @@ export class NRPEngine extends EngineBase {
     if (!adapter) throw new Error("No WebGPU adapter found.");
     const L = adapter.limits;
     if (L.maxComputeWorkgroupStorageSize < 24576) throw new Error("GPU lacks 24 KB workgroup memory.");
+    // 16-bit arithmetic where the GPU has it: about a third faster on an RTX 3080
     const device = await adapter.requestDevice({
+      requiredFeatures: adapter.features.has("shader-f16") ? ["shader-f16"] : [],
       requiredLimits: {
         maxStorageBufferBindingSize: L.maxStorageBufferBindingSize,
         maxBufferSize: L.maxBufferSize,
@@ -49,13 +81,15 @@ export class NRPEngine extends EngineBase {
     const GC = PIXIN + 4;
     const off = {}; let cur = 0;
     const alloc = (k, n) => { off[k] = cur; cur += Math.ceil(n / 4) * 4; };
-    alloc("W0", WD * IN); alloc("B0", WD); alloc("W0G", geo ? 6 * WD : 0);
+    // W0T: the pixel columns input-major, padded with zero rows to a whole vec4 of inputs
+    alloc("W0T", Math.ceil(PIXIN / 4) * 4 * WD); alloc("W0G", geo ? 6 * WD : 0);
     alloc("HID", NH * (WD * WD + WD)); alloc("HIDB", NH * WD * WD);
     alloc("WO", NO * WD); alloc("BO", 8);
     const P = new Float32Array(cur);
-    P.set(layers[0].w, off.W0); P.set(layers[0].b, off.B0);
+    for (let k = 0; k < PIXIN; k++) for (let c = 0; c < WD; c++) P[off.W0T + k * WD + c] = layers[0].w[c * IN + k];
     if (geo) for (let j = 0; j < 6; j++) for (let c = 0; c < WD; c++) P[off.W0G + j * WD + c] = layers[0].w[c * IN + GC + j];
-    // Light columns stay on the CPU: add = W0[:, light] . ln is computed once per light.
+    // Light columns and the layer-0 bias stay on the CPU: add = b0 + W0[:, light] . ln, once per light.
+    this.B0 = layers[0].b;
     this.W0L = new Float32Array(WD * 4);
     for (let c = 0; c < WD; c++) for (let j = 0; j < 4; j++) this.W0L[c * 4 + j] = layers[0].w[c * IN + PIXIN + j];
     this.WD = WD;
@@ -82,6 +116,16 @@ export class NRPEngine extends EngineBase {
     const S = makeShaders({ WD, NH, W, H, levels: net.grid_res.length, feats: net.feats, gridRes: net.grid_res,
       gridOff, off, auxDim, geo, mul, IN });
     this.S = S;
+    const half = dev.features.has("shader-f16");
+    this.half = half;
+    const lim = dev.limits;
+    // Kernel shapes that fit this device: workgroup memory, invocations, and a light's workgroups
+    this.kernels = KERNELS.filter((k) => {
+      const tile = (k.threads / S.CG) * k.pixels;
+      const bytes = tile * WD * (half ? 2 : 4) + tile * 32 + tile * S.NO * 4;
+      return k.threads % S.CG === 0 && k.threads <= lim.maxComputeInvocationsPerWorkgroup &&
+        bytes <= lim.maxComputeWorkgroupStorageSize && Math.ceil(NP / tile) <= lim.maxComputeWorkgroupsPerDimension;
+    });
     const mod = (code, label) => dev.createShaderModule({ code, label });
     const cp = (code, label) => dev.createComputePipelineAsync({ layout: "auto", compute: { module: mod(code, label), entryPoint: "main" }, label });
     const [pPre, pFwd, pComp, pLoss, pGrad] = await Promise.all([
@@ -108,7 +152,7 @@ export class NRPEngine extends EngineBase {
     const gridBuf = buf(grid.byteLength, ST, grid);
     const auxBuf = buf(auxB.byteLength, ST, auxB);
     this.pgeoBuf = buf(pgeo.byteLength, ST, pgeo);
-    this.h0Buf = buf(NP * WD * 4, ST);
+    this.xBuf = buf(NP * S.XW * 4, ST);   // pixel inputs as f16 pairs (was a WD-float first-layer cache per pixel)
     this.outBuf = buf(MAX_LIGHTS * NP * 16, ST);
     this.refBuf = buf(NP * 16, ST);
     this.dispBuf = buf(NP * 4, ST);
@@ -137,17 +181,17 @@ export class NRPEngine extends EngineBase {
       layout: pipe.getBindGroupLayout(group),
       entries: bufs.map((b, i) => ({ binding: i, resource: { buffer: b } })),
     });
-    this.bgFwd = bg(pFwd, 0, [this.wBuf, this.h0Buf, this.jobsBuf, this.fwdU, this.subIdxBuf, this.pgeoBuf, this.outBuf]);
-    this.bgFwdSub = bg(pFwd, 0, [this.wBuf, this.h0Buf, this.jobsSubBuf, this.fwdSubU, this.subIdxBuf, this.pgeoBuf, this.subOutBuf]);
+    this.bgFwd = bg(pFwd, 0, [this.wBuf, this.xBuf, this.jobsBuf, this.fwdU, this.subIdxBuf, this.pgeoBuf, this.outBuf]);
+    this.bgFwdSub = bg(pFwd, 0, [this.wBuf, this.xBuf, this.jobsSubBuf, this.fwdSubU, this.subIdxBuf, this.pgeoBuf, this.subOutBuf]);
     this.bgComp = bg(pComp, 0, [this.frameBuf, this.outBuf, this.pgeoBuf, this.refBuf, this.dispBuf, this.hdrBuf]);
     this.bgBlit = bg(pBlit, 0, [this.dispBuf]);
     this.bgLoss = bg(pLoss, 0, [this.frameBuf, this.optU, this.subIdxBuf, this.subOutBuf, this.tgtBuf, this.pgeoBuf, this.dLdIBuf, this.subDirBuf]);
-    this.bgGrad0 = bg(pGrad, 0, [this.wBuf, this.h0Buf, this.jobsSubBuf, this.fwdSubU, this.subIdxBuf, this.pgeoBuf]);
+    this.bgGrad0 = bg(pGrad, 0, [this.wBuf, this.xBuf, this.jobsSubBuf, this.fwdSubU, this.subIdxBuf, this.pgeoBuf]);
     this.bgGrad1 = bg(pGrad, 1, [this.frameBuf, this.optU, this.dLdIBuf, this.subOutBuf, this.subDirBuf, this.scrBuf, this.partBuf]);
 
-    // --- precompute the light-independent part of layer 0
+    // --- precompute each pixel's network inputs
     onProgress("precomputing pixel features");
-    const bgPre = bg(pPre, 0, [gridBuf, auxBuf, this.wBuf, this.h0Buf]);
+    const bgPre = bg(pPre, 0, [gridBuf, auxBuf, this.xBuf]);
     const enc = dev.createCommandEncoder();
     const pass = enc.beginComputePass();
     pass.setPipeline(pPre); pass.setBindGroup(0, bgPre);
@@ -157,7 +201,72 @@ export class NRPEngine extends EngineBase {
     await dev.queue.onSubmittedWorkDone();
     gridBuf.destroy(); auxBuf.destroy();
 
+    // --- the display kernel: f16 weights beside the f32 ones the gradient path reads
+    this.wBufH = half ? buf(P.length * 2, ST, toHalf(P)) : this.wBuf;
+    const want = new URLSearchParams(location.search).get("kernel");
+    const first = this.kernels.find((k) => kernelKey(k) === want) || this.kernels[0];
+    if (!first) throw new Error("not enough workgroup memory for the display kernel");
+    await this.setKernel(first);
+    if (!want && this.kernels.length > 1) {
+      onProgress("timing kernel shapes");
+      await this.tune();
+    }
+
     return scene;
+  }
+
+  // ------------------------------------------------------------------ display kernel
+  get kernelName() { return kernelKey(this.kernel) + (this.half ? " f16" : " f32"); }
+
+  async kernelPipeline(k) {
+    const code = this.S.fastForward({ ...k, half: this.half });
+    return this.device.createComputePipelineAsync({
+      layout: "auto", compute: { module: this.device.createShaderModule({ code, label: `forward ${kernelKey(k)}` }), entryPoint: "main" } });
+  }
+
+  async setKernel(k) {
+    const pipeline = await this.kernelPipeline(k);
+    this.kernel = k;
+    this.pFast = pipeline;
+    // subIdx (binding 4) is not read by the display kernel, so it is not in its layout
+    const list = [[0, this.wBufH], [1, this.xBuf], [2, this.jobsBuf], [3, this.fwdU], [5, this.pgeoBuf], [6, this.outBuf]];
+    this.bgFast = this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0), entries: list.map(([binding, b]) => ({ binding, resource: { buffer: b } })) });
+    this.tile = (k.threads / this.S.CG) * k.pixels;
+  }
+
+  /** Times each kernel shape that fits on a light in the middle of the box, and keeps the fastest. */
+  async tune(runs = 3) {
+    const light = { pos: [0, 1, 2].map((i) => (this.lo[i] + this.hi[i]) / 2), radius: (this.rmin + this.rmax) / 2,
+      color: [1, 1, 1], intensity: 1, slot: 0 };
+    const times = {};
+    let best = null;
+    for (const k of this.kernels) {
+      await this.setKernel(k);
+      this.evalLights([light], 1);          // the first run of a pipeline sets it up
+      await this.device.queue.onSubmittedWorkDone();
+      const t0 = performance.now();
+      for (let i = 0; i < runs; i++) this.evalLights([light], 1);
+      await this.device.queue.onSubmittedWorkDone();
+      const ms = (performance.now() - t0) / runs;
+      times[kernelKey(k)] = ms;
+      if (!best || ms < best.ms) best = { k, ms };
+    }
+    await this.setKernel(best.k);
+    this.kernelTimes = times;
+    console.info("kernel shapes (ms per light):", times, "->", kernelKey(best.k));
+  }
+
+  /** One dispatch evaluating lights at stride s with the display kernel. */
+  evalLights(ls, s) {
+    const n = Math.ceil(this.W / s) * Math.ceil(this.H / s);
+    this.device.queue.writeBuffer(this.fwdU, 0, new Uint32Array([n, 0, s, this.NP]));
+    this.writeJobs(this.jobsBuf, ls.map((l) => [l, l.slot]));
+    const enc = this.device.createCommandEncoder(), pass = enc.beginComputePass();
+    pass.setPipeline(this.pFast); pass.setBindGroup(0, this.bgFast);
+    pass.dispatchWorkgroups(Math.ceil(n / this.tile), ls.length);
+    pass.end();
+    this.device.queue.submit([enc.finish()]);
   }
 
   // ------------------------------------------------------------------ helpers
@@ -187,7 +296,7 @@ export class NRPEngine extends EngineBase {
       const ln = this.normLight(l);
       for (let c = 0; c < WD; c++) {
         const w = c * 4;
-        F[o + 8 + c] = this.W0L[w] * ln[0] + this.W0L[w + 1] * ln[1] + this.W0L[w + 2] * ln[2] + this.W0L[w + 3] * ln[3];
+        F[o + 8 + c] = this.B0[c] + this.W0L[w] * ln[0] + this.W0L[w + 1] * ln[1] + this.W0L[w + 2] * ln[2] + this.W0L[w + 3] * ln[3];
       }
     });
     this.device.queue.writeBuffer(buffer, 0, F);
@@ -208,14 +317,7 @@ export class NRPEngine extends EngineBase {
     }
     const t0 = performance.now();
     for (const [s, ls] of groups) {
-      const n = Math.ceil(this.W / s) * Math.ceil(this.H / s);
-      dev.queue.writeBuffer(this.fwdU, 0, new Uint32Array([n, 0, s, this.NP]));
-      this.writeJobs(this.jobsBuf, ls.map((l) => [l, l.slot]));
-      const enc = dev.createCommandEncoder(), pass = enc.beginComputePass();
-      pass.setPipeline(this.pFwd); pass.setBindGroup(0, this.bgFwd);
-      pass.dispatchWorkgroups(Math.ceil(n / this.S.TP), ls.length);
-      pass.end();
-      dev.queue.submit([enc.finish()]);
+      this.evalLights(ls, s);
     }
     if (groups.size === 1 && !this._timing) {
       this._timing = true;

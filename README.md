@@ -52,8 +52,11 @@ On Windows, `lan` and `https` need Windows Firewall to allow Node on the network
 |---|---|
 | `?backend=webgpu` / `?backend=webgl` | force a backend (the header switch does the same and keeps your lights) |
 | `?res=384` / `?res=768` | use a smaller or larger export of the scene (smaller is faster on weak GPUs; reference renders exist only at native size) |
+| `?kernel=128x4` | force a WebGPU kernel shape (threads × pixels per thread) instead of timing them at load |
 
 On slow GPUs, a moving light is previewed on every 2nd, 4th or 8th pixel, chosen from measured timings, and refined to full resolution about 150 ms after it stops.
+
+On WebGPU the network runs in 16-bit floats where the GPU supports `shader-f16` (about a third faster, at most about 3/255 off), and at load the viewer times several kernel shapes and keeps the fastest (logged to the console). Painting and optimizing stays in 32-bit floats.
 
 ## Train your own models
 
@@ -130,7 +133,6 @@ Regions the camera's paths rarely reach, like the wall behind the tall box, are 
 
 Issues and pull requests are welcome. Good places to start:
 
-- **fp16 kernels** (`shader-f16`) in `shaders.js`, which should roughly halve the cost per light
 - **new scenes** in `nrp/scenes.py`
 - more path samples for regions the camera rarely reaches
 
