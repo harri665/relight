@@ -1,6 +1,21 @@
 // Backend-independent parts of the runtime: scene loading, camera maths, light normalisation.
 export const MAX_LIGHTS = 8;
 
+/**
+ * How each engine runs the network best on this GPU (its kernel shape, tuned at load) is kept in
+ * localStorage under `key`, so a returning visitor skips the timing. `?kernel=...` overrides it, and
+ * `?kernel=tune` times the shapes again. Storage can be missing or blocked; then it just tunes.
+ */
+export function chooseKernel(key) {
+  const want = new URLSearchParams(location.search).get("kernel");
+  if (want === "tune") return { name: null, forced: false };
+  if (want) return { name: want, forced: true };
+  try { return { name: localStorage.getItem(key), forced: false }; } catch { return { name: null, forced: false }; }
+}
+export function rememberKernel(key, name) {
+  try { localStorage.setItem(key, name); } catch { /* not kept; it is timed again next visit */ }
+}
+
 export const f16tab = (() => {
   const t = new Float32Array(65536);
   for (let h = 0; h < 65536; h++) {
@@ -17,6 +32,48 @@ export function typed(buf, entry) {
   const out = new Float32Array(n);
   for (let i = 0; i < n; i++) out[i] = f16tab[h[i]];
   return out;
+}
+
+/**
+ * Unpacks pixel format 2 (nrp/pixels.py): per channel, a plane of 16-bit values stored as
+ * differences from the value to their left, low bytes then high bytes. Returns what format 1
+ * stored: aux [NP * C] (the network's features), geom [NP * 4] (position, camera distance; 0 where
+ * the pixel sees nothing) and normal [NP * 3] (the aux features' normals).
+ */
+function unpackPixels(buf, px, W, H, O) {
+  const NP = W * H;
+  const planes = (entry, put) => {
+    const bytes = new Uint8Array(buf, entry.offset, entry.bytes);
+    for (let k = 0; k < entry.channels; k++) {
+      const lo = k * 2 * NP, hi = lo + NP;
+      for (let y = 0; y < H; y++) {
+        let v = 0;
+        for (let p = y * W, end = p + W; p < end; p++) {
+          v = (v + (bytes[lo + p] | (bytes[hi + p] << 8))) & 0xffff;
+          put(p, k, v);
+        }
+      }
+    }
+  };
+  const C = px.aux.channels;
+  const aux = new Float32Array(NP * C);
+  planes(px.aux, (p, k, v) => { aux[p * C + k] = f16tab[v]; });
+  const q = new Uint16Array(NP * 3);
+  planes(px.pos, (p, k, v) => { q[p * 3 + k] = v; });
+  const [lo, hi] = px.pos.range, step = (hi - lo) / 65534;
+  const geom = new Float32Array(NP * 4), normal = new Float32Array(NP * 3);
+  for (let p = 0; p < NP; p++) {
+    for (let k = 0; k < 3; k++) normal[p * 3 + k] = aux[p * C + 3 + k];
+    if (!q[p * 3]) continue;
+    let d2 = 0;
+    for (let k = 0; k < 3; k++) {
+      const x = lo + (q[p * 3 + k] - 1) * step;
+      geom[p * 4 + k] = x;
+      d2 += (x - O[k]) ** 2;
+    }
+    geom[p * 4 + 3] = Math.sqrt(d2);
+  }
+  return { aux, geom, normal };
 }
 
 /**
@@ -61,14 +118,19 @@ export class EngineBase {
     this.paramCount = grid.length + layers.reduce((a, l) => a + l.w.length + l.b.length, 0);
     this.modelBytes = model.byteLength;
 
-    const aux = typed(pixels, scene.pixels.aux);
-    this.geom = typed(pixels, scene.pixels.geom);
-    this.normal = typed(pixels, scene.pixels.normal);
-
     const M = scene.camera.to_world;
     const col = (j) => [M[0][j], M[1][j], M[2][j]];
     const tx = Math.tan((scene.camera.fov * Math.PI) / 360);
     this.cam = { X: col(0), Y: col(1), Z: col(2), O: col(3), tx, ty: (tx * H) / W };
+
+    let aux;
+    if (scene.pixels.format === 2) {
+      ({ aux, geom: this.geom, normal: this.normal } = unpackPixels(pixels, scene.pixels, W, H, this.cam.O));
+    } else {
+      aux = typed(pixels, scene.pixels.aux);
+      this.geom = typed(pixels, scene.pixels.geom);
+      this.normal = typed(pixels, scene.pixels.normal);
+    }
     this.lo = scene.light_bbox[0]; this.hi = scene.light_bbox[1];
     [this.rmin, this.rmax] = scene.radius_range;
 

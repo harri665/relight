@@ -316,31 +316,19 @@
   "light_grids": []
  },
  "pixels": {
+  "format": 2,
   "aux": {
    "offset": 0,
-   "dtype": "float16",
-   "shape": [
-    512,
-    512,
-    7
-   ]
+   "bytes": 3670016,
+   "channels": 7
   },
-  "geom": {
+  "pos": {
    "offset": 3670016,
-   "dtype": "float32",
-   "shape": [
-    512,
-    512,
-    4
-   ]
-  },
-  "normal": {
-   "offset": 7864320,
-   "dtype": "float16",
-   "shape": [
-    512,
-    512,
-    3
+   "bytes": 1572864,
+   "channels": 3,
+   "range": [
+    -1.001,
+    1.001
    ]
   }
  },

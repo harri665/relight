@@ -9,12 +9,19 @@
 // Inverse lighting: colour and the direct-view term have exact gradients (computed on the CPU from
 // the network outputs). For the 4 light inputs of the network, central finite differences are used,
 // evaluated in one batch with the base value on the sampled pixels.
-import { EngineBase, MAX_LIGHTS, f16tab } from "./engine-base.js";
+import { EngineBase, MAX_LIGHTS, f16tab, chooseKernel, rememberKernel } from "./engine-base.js";
 
 const MAXV = 9 * MAX_LIGHTS;  // variants per gradient batch: base, then ±h on each of 4 inputs, per light
 const SUB_W = 256;            // item-grid width for pixel-subset evaluation
 const SUB_K = 4096;           // max pixels per gradient step
 const BAND_BYTES = 16 << 20;  // target size of one activation texture array
+// Output groups (of 4 channels) a pass of a layer writes, for displayed lights. Fewer mean more
+// passes, each reading every input again, but fewer accumulators each: on an RTX 3080 one a pass
+// runs the network about twice as fast as eight. Which is fastest depends on the GPU, so load()
+// times them (tune) and remembers the result (chooseKernel); until then the default runs.
+const OUTPUTS = [1, 2, 4, 8];
+const DEFAULT_OUTPUTS = 2;
+const outputsName = (n) => `o${n}`;
 
 const yieldChannel = new MessageChannel(), yieldWaiters = [];
 yieldChannel.port1.onmessage = () => yieldWaiters.shift()();
@@ -45,7 +52,10 @@ function layerFS({ kin, out, relu, stage, items, W, xg = 0, geo = false, mul = f
   const J = [...Array(out).keys()];
   const acc = (x, b) => J.map((j) => `a${j} += w[${b} + ${4 * j}] * ${x}.x + w[${b} + ${4 * j + 1}] * ${x}.y + ` +
     `w[${b} + ${4 * j + 2}] * ${x}.z + w[${b} + ${4 * j + 3}] * ${x}.w;`).join("\n    ");
-  const needItem = stage === "l0" || (stage === "out" && mul);
+  // Displayed lights with the 'mul' head write a and b of a * G + b as they are, into two targets;
+  // the composite applies G per pixel, so a preview keeps the light's shape (see netAt there)
+  const split = stage === "out" && mul && items === "full";
+  const needItem = stage === "l0" || (stage === "out" && mul && !split);
   const nTex = stage === "l0" ? xg : kin;
   const item = {
     full: "ivec2 itemPixel(int x, int row, out vec4 L) { L = ln; return ivec2(x, row) * stride; }",
@@ -56,7 +66,7 @@ function layerFS({ kin, out, relu, stage, items, W, xg = 0, geo = false, mul = f
   return ivec2(p % ${W}, p / ${W});
 }`,
   }[items];
-  const targets = stage === "out" ? 1 : out;
+  const targets = split ? 2 : stage === "out" ? 1 : out;
   return HEAD + `
 uniform sampler2DArray src;
 layout(std140) uniform Wt { vec4 w[${kin * out * 4}]; };
@@ -88,7 +98,7 @@ ${[...Array(targets).keys()].map((j) => `layout(location = ${j}) out vec4 o${j};
 void main() {
   ivec2 q = ivec2(gl_FragCoord.xy);
   ${stage === "l0" ? "vec4 L; ivec2 px = itemPixel(q.x, q.y + yOff, L);" : "ivec2 px = ivec2(q.x, q.y - yOff);"}
-  ${stage === "out" && mul ? "vec4 L; ivec2 ip = itemPixel(q.x, q.y, L);" : ""}
+  ${stage === "out" && mul && !split ? "vec4 L; ivec2 ip = itemPixel(q.x, q.y, L);" : ""}
   ${J.map((j) => `vec4 a${j} = bias[${j}];`).join(" ")}
   for (int k = 0; k < ${nTex}; k++) {
     vec4 x = texelFetch(src, ivec3(px, k), 0);
@@ -100,7 +110,8 @@ void main() {
   geoFeatures(px, L, g0, g1, G);
   ${acc("g0", (xg + 1) * out * 4)}
   ${acc("g1", (xg + 2) * out * 4)}` : ""}
-  ${stage === "out" && mul ? `vec4 g0, g1; float G;
+  ${split ? "o0 = vec4(a0.xyz, 0.0); o1 = vec4(a0.w, a1.xy, 0.0);"
+    : stage === "out" && mul ? `vec4 g0, g1; float G;
   geoFeatures(ip, L, g0, g1, G);
   o0 = vec4(a0.xyz * G + vec3(a0.w, a1.xy), 0.0);`
     : stage === "out" ? "o0 = a0;"
@@ -109,8 +120,8 @@ void main() {
 }
 
 // Port of `composite` in shaders.js. Writes the display colour and the HDR image.
-const compositeFS = (W, H) => HEAD + `
-uniform sampler2DArray outT; uniform sampler2D geomT; uniform sampler2D refT;
+const compositeFS = (W, H, mul) => HEAD + `
+uniform sampler2DArray outT; uniform sampler2D geomT; uniform sampler2D refT; uniform sampler2D normT;
 uniform vec3 camO, camX, camY, camZ; uniform vec2 tanxy;
 uniform float exposure; uniform int mode, nLights, refLight;
 uniform vec4 lPR[${MAX_LIGHTS}]; uniform vec3 lE[${MAX_LIGHTS}]; uniform ivec3 lInfo[${MAX_LIGHTS}];  // slot, enabled, stride
@@ -147,16 +158,38 @@ float directCov(ivec2 pix, int l) {
   }
   return cnt / 16.0;
 }
-// Network output of a light slot at pix; a preview at stride s > 1 is upsampled like netAt in shaders.js.
-vec3 netAt(int slot, int s, ivec2 pix) {
-  if (s <= 1) return max(texelFetch(outT, ivec3(pix, slot), 0).xyz, 0.0);
+// A slot's output at item c: rgb (a), or with the 'mul' head a and b of a * G + b (two layers a slot)
+void outAt(ivec2 c, int slot, out vec3 a, out vec3 b) {
+  ${mul ? `a = texelFetch(outT, ivec3(c, 2 * slot), 0).xyz;
+  b = texelFetch(outT, ivec3(c, 2 * slot + 1), 0).xyz;`
+    : `a = max(texelFetch(outT, ivec3(c, slot), 0).xyz, 0.0);
+  b = vec3(0.0);`}
+}
+// Light l's unshadowed irradiance factor G at pix (geo_features in nrp/model.py)
+float irradiance(ivec2 pix, int l) {
+  vec4 gm = texelFetch(geomT, pix, 0);
+  if (gm.w <= 0.0) return 0.0;
+  vec3 v = lPR[l].xyz - gm.xyz;
+  float d = max(length(v), 1e-4);
+  float cosv = dot(texelFetch(normT, pix, 0).xyz, v / d);
+  float s = min(lPR[l].w / d, 1.0);
+  float omega = 6.283185307 * s * s / (1.0 + sqrt(max(1.0 - s * s, 0.0)));
+  return omega * max(cosv, 0.0) / 3.141592654;
+}
+// Network output of light l (in its slot) at pix; a preview at stride s > 1 is upsampled like
+// netAt in shaders.js, with a and b interpolated apart before G is applied at the pixel itself.
+vec3 netAt(int l, int slot, int s, ivec2 pix) {
+  vec3 a, b;
+  if (s <= 1) {
+    outAt(pix, slot, a, b);
+  } else {
   ivec2 last = ivec2((${W} + s - 1) / s - 1, (${H} + s - 1) / s - 1);
   vec2 f = vec2(pix) / float(s);
   ivec2 c0 = min(ivec2(f), last), c1 = min(c0 + 1, last);
   vec2 t = f - vec2(c0);
   vec4 g = texelFetch(geomT, pix, 0);
   float sig = 1.5 * float(s) * 2.0 * tanxy.x / W * max(g.w, 1e-3);
-  vec3 acc = vec3(0.0); float ws = 0.0;
+  vec3 accA = vec3(0.0), accB = vec3(0.0); float ws = 0.0;
   for (int k = 0; k < 4; k++) {
     ivec2 c = ivec2((k & 1) == 1 ? c1.x : c0.x, k >= 2 ? c1.y : c0.y);
     float wb = ((k & 1) == 1 ? t.x : 1.0 - t.x) * (k >= 2 ? t.y : 1.0 - t.y);
@@ -164,10 +197,14 @@ vec3 netAt(int slot, int s, ivec2 pix) {
     vec3 dq = q.xyz - g.xyz;
     float wg = (q.w > 0.0) == (g.w > 0.0) ? exp(-dot(dq, dq) / (2.0 * sig * sig)) : 0.0;
     float w = wb * (wg + 1e-4);
-    acc += w * max(texelFetch(outT, ivec3(c, slot), 0).xyz, 0.0);
+    vec3 ca, cb;
+    outAt(c, slot, ca, cb);
+    accA += w * ca; accB += w * cb;
     ws += w;
   }
-  return acc / max(ws, 1e-12);
+  a = accA / max(ws, 1e-12); b = accB / max(ws, 1e-12);
+  }
+  return ${mul ? "max(a * irradiance(pix, l) + b, 0.0)" : "a"};
 }
 vec3 tone(vec3 x) { vec3 y = max(x, 0.0) * exposure; return y / (1.0 + y); }
 vec3 srgb(vec3 c) { return mix(1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, 12.92 * c, lessThanEqual(c, vec3(0.0031308))); }
@@ -181,7 +218,7 @@ void main() {
   for (int l = 0; l < ${MAX_LIGHTS}; l++) {
     if (l >= nLights) break;
     if (lInfo[l].y == 0) continue;
-    vec3 nrp = netAt(lInfo[l].x, lInfo[l].z, pix);
+    vec3 nrp = netAt(l, lInfo[l].x, lInfo[l].z, pix);
     I += lE[l] * (nrp + directCov(pix, l));
   }
   hdr = vec4(I, 0.0);
@@ -293,8 +330,10 @@ export class GLEngine extends EngineBase {
     };
     const F16 = { ifmt: gl.RGBA16F, bytes: 8 }, F32 = { ifmt: gl.RGBA32F, bytes: 16 };
     const subFmt = this.f32 ? F32 : F16;
-    const outFull = pickOut(F16.bytes), outSub = pickOut(subFmt.bytes);
-    const wFull = netFor(outFull), wSub = netFor(outSub);
+    const outSub = pickOut(subFmt.bytes), wSub = netFor(outSub);
+    // displayed lights: every output count that fits, packed now as the uniform buffer is built once
+    this.outOptions = OUTPUTS.filter((n) => n <= maxRT && G % n === 0 && G * 64 * n <= maxBlock && n * F16.bytes <= 64);
+    const wByOut = new Map(this.outOptions.map((n) => [n, netFor(n)]));
     this.wOut = place(packLayer(layers[NH + 1], WD, G, outGroups, (k, c) => 4 * k + c)[0]);
     const all = new Float32Array(uboLen / 4);
     for (const [off, w] of blocks) all.set(w, off / 4);
@@ -350,9 +389,10 @@ export class GLEngine extends EngineBase {
     gl.texSubImage2D(T2, 0, 0, 0, W, H, gl.RGBA, gl.FLOAT, n4);
     this.refTex = tex(T2, gl.RGBA32F, W, H);
     this.idxTex = tex(T2, gl.R32UI, SUB_W, SUB_K / SUB_W);
-    const outTex = tex(A2, gl.RGBA16F, W, H, MAX_LIGHTS);
+    // a slot a layer, or two with the 'mul' head (a, then b)
+    const outTex = tex(A2, gl.RGBA16F, W, H, MAX_LIGHTS * (mul ? 2 : 1));
     this.outTex = outTex;
-    this.outFbos = Array.from({ length: MAX_LIGHTS }, (_, s) => this.fbo([[outTex, s]]));
+    this.outFbos = Array.from({ length: MAX_LIGHTS }, (_, s) => this.fbo(mul ? [[outTex, 2 * s], [outTex, 2 * s + 1]] : [[outTex, s]]));
     const subOut = tex(T2, subFmt.ifmt, SUB_W, (SUB_K / SUB_W) * MAXV);
     this.subFbo = this.fbo([[subOut]]);
     const dispTex = tex(T2, gl.RGBA8, W, H), hdrTex = tex(T2, this.f32 ? gl.RGBA32F : gl.RGBA16F, W, H);
@@ -364,23 +404,76 @@ export class GLEngine extends EngineBase {
     onProgress("compiling shaders");
     this.vao = gl.createVertexArray();
     gl.bindVertexArray(this.vao);
-    this.pComp = this.program(compositeFS(W, H), "composite");
+    this.pComp = this.program(compositeFS(W, H, mul), "composite");
     const evaluator = (fmt, out, weights, gw, rows, items) => {
       const th = Math.max(8, Math.min(rows, Math.floor(BAND_BYTES / (gw * G * fmt.bytes))));
       const arrs = [0, 1].map(() => tex(A2, fmt.ifmt, gw, th, G));
       const fbos = arrs.map((t) => Array.from({ length: G / out }, (_, p) =>
         this.fbo(Array.from({ length: out }, (_, j) => [t, p * out + j]))));
       return {
-        gw, th, arrs, fbos, w: weights,
+        outN: out, gw, th, arrs, fbos, w: weights,
         l0: this.program(layerFS({ kin: XG + 1 + (geo ? 2 : 0), out, relu: true, stage: "l0", items, W, xg: XG, geo }), `layer 0 (${items})`),
         hid: this.program(layerFS({ kin: G, out, relu: true, stage: "hid", items, W }), "hidden layer"),
         out: this.program(layerFS({ kin: G, out: outGroups, relu: false, stage: "out", items, W, mul }), `output layer (${items})`),
         mul,
       };
     };
-    this.full = evaluator(F16, outFull, wFull, W, H, "full");
     this.sub = evaluator(subFmt, outSub, wSub, SUB_W, (SUB_K / SUB_W) * MAXV, "sub");
+    this.makeFull = (out) => evaluator(F16, out, wByOut.get(out), W, H, "full");
+
+    // remembered per GPU, network shape and image size (chooseKernel)
+    this.kernelStore = `relight-kernel:webgl:${this.adapterInfo.description}:${W}x${H}:${WD}x${NH}`;
+    const { name, forced } = chooseKernel(this.kernelStore);
+    const known = this.outOptions.find((n) => outputsName(n) === name);
+    this.setOutputs(known ?? this.outOptions.filter((n) => n <= DEFAULT_OUTPUTS).pop() ?? this.outOptions[0]);
+    if (known === undefined && !forced && this.outOptions.length > 1) {
+      onProgress("timing shader passes");
+      await this.tune();
+      rememberKernel(this.kernelStore, this.kernelName);
+    }
     return scene;
+  }
+
+  // ------------------------------------------------------------------ display passes
+  get kernelName() { return outputsName(this.full.outN); }
+
+  /** Runs displayed lights with passes of `out` output groups. */
+  setOutputs(out) {
+    if (this.full?.outN === out) return;
+    const old = this.full;
+    this.full = this.makeFull(out);
+    if (old) this.disposeEvaluator(old);
+  }
+
+  disposeEvaluator(E) {
+    const gl = this.gl;
+    E.arrs.forEach((t) => gl.deleteTexture(t));
+    E.fbos.flat().forEach((f) => gl.deleteFramebuffer(f));
+    [E.l0, E.hid, E.out].forEach((P) => gl.deleteProgram(P.p));
+  }
+
+  /** Times each output count on a light in the middle of the box, and keeps the fastest. */
+  async tune(runs = 3) {
+    const gl = this.gl;
+    const ln = this.normLight({ pos: [0, 1, 2].map((i) => (this.lo[i] + this.hi[i]) / 2), radius: (this.rmin + this.rmax) / 2 });
+    const run = () => this.runNet(this.full, this.H, (u) => { gl.uniform4fv(u.ln, ln); gl.uniform1i(u.stride, 1); },
+      () => gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, this.outFbos[0]), this.W);
+    const times = {};
+    let best = null;
+    for (const n of this.outOptions) {
+      this.setOutputs(n);
+      run();                                  // the first run compiles the shaders
+      await this.fence();
+      const t0 = performance.now();
+      for (let i = 0; i < runs; i++) run();
+      await this.fence();
+      const ms = (performance.now() - t0) / runs;
+      times[outputsName(n)] = ms;
+      if (!best || ms < best.ms) best = { n, ms };
+    }
+    this.setOutputs(best.n);
+    this.kernelTimes = times;
+    console.info("outputs per pass (ms per light):", times, "->", outputsName(best.n));
   }
 
   // ------------------------------------------------------------------ GL helpers
@@ -517,6 +610,7 @@ export class GLEngine extends EngineBase {
     gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D_ARRAY, this.outTex);
     gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, this.geomTex);
     gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, this.refTex);
+    gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, this.normTex);
     gl.bindVertexArray(this.vao);
     gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, this.compFbo);
     gl.viewport(0, 0, W, H);
