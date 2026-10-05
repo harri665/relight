@@ -35,6 +35,7 @@ export function makeShaders(c) {
   const IN = c.IN;
   const NP = W * H;
   const NO = mul ? 6 : 3;
+  const OUTV = mul ? 2 : 1;   // vec4s per item of the display output buffer (a, then b)
   const JOB = 2 + CG;
   const PS = WD + 8;          // per-tile partial sums: sum g0 [WD], dln extra [4], dE [3], loss
   const u = (x) => `${x >>> 0}u`;
@@ -452,18 +453,17 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) t: u3
     workgroupBarrier();
   }
 
-  // Output rows (rgb, or the 'mul' head's a and b), then a * G + b per pixel
+  // Output rows: rgb, or the 'mul' head's a and b as they are (two vec4s an item), which the
+  // composite puts together as a * G + b at every pixel (see netAt there)
   for (var e = t; e < ${u(TPf * NO)}; e += ${u(threads)}) {
     res[e] = outRow(e % ${u(NO)}, e / ${u(NO)});
   }
   workgroupBarrier();
   if (t < ${u(TPf)} && base + t < n) {
     let r = t * ${u(NO)};
-    let o = (u32(jobs[jb + 1u].x) * fu.slotStride + base + t) * 4u;
-    ${mul
-      ? `let G = pf[2u * t + 1u].z;
-    outB[o] = res[r] * G + res[r + 3u]; outB[o + 1u] = res[r + 1u] * G + res[r + 4u]; outB[o + 2u] = res[r + 2u] * G + res[r + 5u];`
-      : "outB[o] = res[r]; outB[o + 1u] = res[r + 1u]; outB[o + 2u] = res[r + 2u];"}
+    let o = (u32(jobs[jb + 1u].x) * fu.slotStride + base + t) * ${u(4 * OUTV)};
+    outB[o] = res[r]; outB[o + 1u] = res[r + 1u]; outB[o + 2u] = res[r + 2u];
+    ${mul ? "outB[o + 4u] = res[r + 3u]; outB[o + 5u] = res[r + 4u]; outB[o + 6u] = res[r + 5u];" : ""}
   }
 }
 `;
@@ -486,13 +486,24 @@ fn heat(x: f32) -> vec3f {
   let t = clamp(x, 0.0, 1.0);
   return clamp(vec3f(1.5 * t, 1.5 * t - 0.5, 3.0 * t - 2.0) + vec3f(0.0, 0.0, 0.25 * (1.0 - t) * t * 4.0), vec3f(0.0), vec3f(1.0));
 }
+${geoFns}
+// The display kernel's output for item i: rgb (a), or with the 'mul' head a and b of a * G + b
+struct Net { a: vec3f, b: vec3f };
+fn outAt(i: u32) -> Net {
+  ${mul ? "return Net(outB[2u * i].xyz, outB[2u * i + 1u].xyz);" : "return Net(max(outB[i].xyz, vec3f(0.0)), vec3f(0.0));"}
+}
+// Light l's network output at pixel p. With the 'mul' head, G (the light's falloff and the surface's
+// angle to it) is computed here at the pixel itself, so a preview keeps the light's shape.
+fn lit(n: Net, p: u32, l: u32) -> vec3f {
+  ${mul ? "let G = geoFeatures(pgeo[2u * p], pgeo[2u * p + 1u].xyz, frame.lights[l].pr).f1.z;\n  return max(n.a * G + n.b, vec3f(0.0));" : "return n.a;"}
+}
 // Network output of light slot "slot" at pixel p. A preview at stride s > 1 holds every s-th pixel
 // (compact, ceil(W/s) columns): interpolate its 4 nearest samples bilinearly, down-weighting samples
 // whose surface point is far from this pixel's (joint bilateral upsampling), so light does not
-// bleed across object edges.
-fn netAt(slot: u32, s: u32, p: u32) -> vec3f {
+// bleed across object edges. a and b are interpolated apart, before G is applied (lit).
+fn netAt(slot: u32, s: u32, p: u32) -> Net {
   let base = slot * NP;
-  if (s <= 1u) { return max(outB[base + p].xyz, vec3f(0.0)); }
+  if (s <= 1u) { return outAt(base + p); }
   let cw = (W + s - 1u) / s; let ch = (H + s - 1u) / s;
   let fx = f32(p % W) / f32(s); let fy = f32(p / W) / f32(s);
   let x0 = min(u32(fx), cw - 1u); let y0 = min(u32(fy), ch - 1u);
@@ -500,7 +511,7 @@ fn netAt(slot: u32, s: u32, p: u32) -> vec3f {
   let tx = fx - f32(x0); let ty = fy - f32(y0);
   let g = pgeo[2u * p];
   let sig = 1.5 * f32(s) * 2.0 * frame.tanxy.x / f32(W) * max(g.w, 1e-3);  // ~1.5 sample spacings
-  var acc = vec3f(0.0); var ws = 0.0;
+  var acc = Net(vec3f(0.0), vec3f(0.0)); var ws = 0.0;
   for (var k = 0u; k < 4u; k++) {
     let cx = select(x0, x1, (k & 1u) == 1u); let cy = select(y0, y1, k >= 2u);
     let wb = select(1.0 - tx, tx, (k & 1u) == 1u) * select(1.0 - ty, ty, k >= 2u);
@@ -509,10 +520,12 @@ fn netAt(slot: u32, s: u32, p: u32) -> vec3f {
     var wg = exp(-dot(dq, dq) / (2.0 * sig * sig));
     if ((q.w > 0.0) != (g.w > 0.0)) { wg = 0.0; }
     let w = wb * (wg + 1e-4);
-    acc += w * max(outB[base + cy * cw + cx].xyz, vec3f(0.0));
+    let o = outAt(base + cy * cw + cx);
+    acc.a += w * o.a; acc.b += w * o.b;
     ws += w;
   }
-  return acc / max(ws, 1e-12);
+  let iw = 1.0 / max(ws, 1e-12);
+  return Net(acc.a * iw, acc.b * iw);
 }
 
 @compute @workgroup_size(64)
@@ -523,7 +536,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   for (var l = 0u; l < frame.nLights; l++) {
     let L = frame.lights[l];
     if (L.info.y == 0u) { continue; }
-    let nrp = netAt(L.info.x, L.info.z, p);
+    let nrp = lit(netAt(L.info.x, L.info.z, p), p, l);
     I += L.e.xyz * (nrp + directCov(p, l));
   }
   hdr[p] = vec4f(I, 0.0);
@@ -731,5 +744,5 @@ ${mlpBody(true)}
 }
 `;
 
-  return { precompute, forward, fastForward, XW, composite, blit, lossPrep, grad, TP, CG, IN, PIXIN, JOB, PS, NO };
+  return { precompute, forward, fastForward, XW, OUTV, composite, blit, lossPrep, grad, TP, CG, IN, PIXIN, JOB, PS, NO };
 }

@@ -1,13 +1,14 @@
 // WebGPU runtime for a neural render proxy exported by nrp/export.py.
 import { makeShaders } from "./shaders.js";
-import { EngineBase, MAX_LIGHTS } from "./engine-base.js";
+import { EngineBase, MAX_LIGHTS, chooseKernel, rememberKernel } from "./engine-base.js";
 
 export { MAX_LIGHTS };
 export { GLEngine } from "./nrp-gl.js";
 
 // Shapes of the display kernel (shaders.js fastForward): threads in a workgroup, and pixels each
 // thread computes. More pixels per thread reuse each weight more often, for more registers; which
-// is fastest depends on the GPU, so load() times them (tune). `?kernel=128x4` forces one.
+// is fastest depends on the GPU, so load() times them (tune) and remembers the fastest
+// per GPU (chooseKernel). `?kernel=128x4` forces one.
 export const KERNELS = [
   { threads: 256, pixels: 4 }, { threads: 128, pixels: 4 }, { threads: 256, pixels: 8 },
   { threads: 128, pixels: 8 }, { threads: 64, pixels: 8 }, { threads: 64, pixels: 4 },
@@ -153,7 +154,7 @@ export class NRPEngine extends EngineBase {
     const auxBuf = buf(auxB.byteLength, ST, auxB);
     this.pgeoBuf = buf(pgeo.byteLength, ST, pgeo);
     this.xBuf = buf(NP * S.XW * 4, ST);   // pixel inputs as f16 pairs (was a WD-float first-layer cache per pixel)
-    this.outBuf = buf(MAX_LIGHTS * NP * 16, ST);
+    this.outBuf = buf(MAX_LIGHTS * NP * 16 * S.OUTV, ST);   // display outputs: rgb, or a and b of a * G + b
     this.refBuf = buf(NP * 16, ST);
     this.dispBuf = buf(NP * 4, ST);
     this.hdrBuf = buf(NP * 16, ST);
@@ -203,13 +204,17 @@ export class NRPEngine extends EngineBase {
 
     // --- the display kernel: f16 weights beside the f32 ones the gradient path reads
     this.wBufH = half ? buf(P.length * 2, ST, toHalf(P)) : this.wBuf;
-    const want = new URLSearchParams(location.search).get("kernel");
-    const first = this.kernels.find((k) => kernelKey(k) === want) || this.kernels[0];
-    if (!first) throw new Error("not enough workgroup memory for the display kernel");
-    await this.setKernel(first);
-    if (!want && this.kernels.length > 1) {
+    // remembered per GPU, network shape and image size (chooseKernel)
+    const ai = this.adapterInfo;
+    this.kernelStore = `relight-kernel:webgpu:${ai.vendor}/${ai.architecture}/${ai.description}:${W}x${H}:${WD}x${NH}:${half ? 16 : 32}`;
+    const { name, forced } = chooseKernel(this.kernelStore);
+    const known = this.kernels.find((k) => kernelKey(k) === name);
+    if (!this.kernels.length) throw new Error("not enough workgroup memory for the display kernel");
+    await this.setKernel(known || this.kernels[0]);
+    if (!known && !forced && this.kernels.length > 1) {
       onProgress("timing kernel shapes");
       await this.tune();
+      rememberKernel(this.kernelStore, kernelKey(this.kernel));
     }
 
     return scene;

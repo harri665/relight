@@ -52,11 +52,11 @@ On Windows, `lan` and `https` need Windows Firewall to allow Node on the network
 |---|---|
 | `?backend=webgpu` / `?backend=webgl` | force a backend (the header switch does the same and keeps your lights) |
 | `?res=384` / `?res=768` | use a smaller or larger export of the scene (smaller is faster on weak GPUs; reference renders exist only at native size) |
-| `?kernel=128x4` | force a WebGPU kernel shape (threads × pixels per thread) instead of timing them at load |
+| `?kernel=128x4` / `?kernel=o2` | force how the network runs: a WebGPU kernel shape (threads × pixels per thread) or WebGL2 output groups per pass; `?kernel=tune` times them again |
 
 On slow GPUs, a moving light is previewed on every 2nd, 4th or 8th pixel, chosen from measured timings, and refined to full resolution about 150 ms after it stops.
 
-On WebGPU the network runs in 16-bit floats where the GPU supports `shader-f16` (about a third faster, at most about 3/255 off), and at load the viewer times several kernel shapes and keeps the fastest (logged to the console). Painting and optimizing stays in 32-bit floats.
+On WebGPU the network runs in 16-bit floats where the GPU supports `shader-f16` (about a third faster, at most about 3/255 off), and at load the viewer times several kernel shapes and keeps the fastest (logged to the console). WebGL2 does the same for how many output groups each shader pass writes (on an RTX 3080, one a pass is about 30% faster than eight). The choice is remembered per GPU, so it is timed only on a first visit. Painting and optimizing stays in 32-bit floats.
 
 ## Train your own models
 

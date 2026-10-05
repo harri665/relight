@@ -1,6 +1,21 @@
 // Backend-independent parts of the runtime: scene loading, camera maths, light normalisation.
 export const MAX_LIGHTS = 8;
 
+/**
+ * How each engine runs the network best on this GPU (its kernel shape, tuned at load) is kept in
+ * localStorage under `key`, so a returning visitor skips the timing. `?kernel=...` overrides it, and
+ * `?kernel=tune` times the shapes again. Storage can be missing or blocked; then it just tunes.
+ */
+export function chooseKernel(key) {
+  const want = new URLSearchParams(location.search).get("kernel");
+  if (want === "tune") return { name: null, forced: false };
+  if (want) return { name: want, forced: true };
+  try { return { name: localStorage.getItem(key), forced: false }; } catch { return { name: null, forced: false }; }
+}
+export function rememberKernel(key, name) {
+  try { localStorage.setItem(key, name); } catch { /* not kept; it is timed again next visit */ }
+}
+
 export const f16tab = (() => {
   const t = new Float32Array(65536);
   for (let h = 0; h < 65536; h++) {
