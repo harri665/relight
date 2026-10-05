@@ -79,6 +79,8 @@ python export.py --run cornell_geo_128x4 --name cornell         # add --res N fo
 python evaluate.py --runs cornell_geo_128x4                     # optional: score against 1024-spp references
 ```
 
+Exports store their per-pixel buffers packed (16-bit positions, each row as differences), which gzip shrinks about 4.5x more than the old float layout. An export from before this can be repacked in place with `python pixels.py <web scene folder>`; the viewer reads both.
+
 ## Project layout
 
 ```
@@ -90,6 +92,7 @@ nrp/                        Python: data generation and training (PyTorch, Mitsu
   denoise.py                OIDN 2 (CUDA via ctypes) with CPU fallback
   model.py / train.py       grid-encoded MLP and pool-based training
   export.py / evaluate.py   export for the viewer; accuracy against references
+  pixels.py                 packs exported per-pixel buffers so they download small (repacks older exports)
 client/                     React 19 + Vite + Tailwind CSS 4 viewer
   src/engine/shaders.js     WGSL: precompute, fused MLP forward, composite, loss, backward
   src/engine/nrp.js         WebGPU engine and Adam light optimizer

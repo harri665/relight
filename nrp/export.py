@@ -2,8 +2,8 @@
 
 Writes client/public/scenes/<name>/scene.json plus binary blobs:
   model.bin  grid levels (f16, [R, R, F] row-major) + MLP layers (f32, [out, in] row-major, bias)
-  pixels.bin per-pixel f16 [H, W, 7] network aux features + f16 [H, W, 4] (position, camera distance, 0 = miss)
-             + f16 [H, W, 3] normals (for placing lights on surfaces)
+  pixels.bin per-pixel network aux features (f16) and surface positions (u16 over the scene's extent,
+             0 = miss), packed so they compress well (pixel format 2, see pixels.py)
   refs.bin   f16 [n, H, W, 3] reference images (denoised gather + analytic direct term) for n test lights
 
 With --res N (other than the resolution the paths were traced at) it exports the same network at
@@ -19,8 +19,9 @@ import numpy as np
 import torch
 
 from common import WEB_SCENES_DIR, WORK_DIR
-from direct import camera_rays, direct_view
+from direct import direct_view
 from model import NRP, PixelBuffers
+from pixels import pack
 
 
 class Blob:
@@ -85,14 +86,10 @@ def main():
         aux = pd.aux
     bufs = PixelBuffers(aux, meta, aux_dim=cfg.get("aux_dim", 7))
     feats = bufs.aux.reshape(H, W, -1)
-    org, _ = camera_rays(meta, torch.zeros(1, 2, device="cuda"))
-    dist = torch.where(aux[..., 9] > 0, (aux[..., 6:9] - org).norm(dim=-1), torch.zeros_like(aux[..., 9]))
-    geom = torch.cat([aux[..., 6:9], dist[..., None]], -1)
-    pb = Blob()
-    pix = {"aux": pb.add(feats.cpu().numpy(), np.float16),
-           "geom": pb.add(geom.cpu().numpy(), np.float32),  # fp32: geo features are sensitive near surfaces
-           "normal": pb.add(aux[..., 3:6].cpu().numpy(), np.float16)}
-    pb.write(out / f"pixels{suffix}.bin")
+    # The viewer derives the camera distance from the position and the normals from the aux features.
+    data, pix = pack(feats.cpu().numpy().astype(np.float16), aux[..., 6:9].float().cpu().numpy(),
+                     (aux[..., 9] > 0).cpu().numpy())
+    (out / f"pixels{suffix}.bin").write_bytes(data)
 
     # Reference renders for a few hand-picked test lights.
     if tier:
