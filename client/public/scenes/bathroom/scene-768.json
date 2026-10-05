@@ -1,0 +1,394 @@
+{
+ "name": "bathroom",
+ "width": 768,
+ "height": 768,
+ "camera": {
+  "to_world": [
+   [
+    -0.659197986125946,
+    0.011633699759840965,
+    -0.7518789768218994,
+    0.007240530103445053
+   ],
+   [
+    0.0,
+    0.9998800158500671,
+    0.015471000224351883,
+    0.9124050140380859
+   ],
+   [
+    0.7519689798355103,
+    0.010198500007390976,
+    -0.6591190099716187,
+    -0.22758400440216064
+   ],
+   [
+    0.0,
+    0.0,
+    0.0,
+    1.0
+   ]
+  ],
+  "fov": 55.0,
+  "fov_axis": "x"
+ },
+ "light_bbox": [
+  [
+   -2.45,
+   0.05,
+   -2.38
+  ],
+  [
+   0.8,
+   2.6,
+   -0.12
+  ]
+ ],
+ "radius_range": [
+  0.05,
+  0.35
+ ],
+ "default_lights": [
+  {
+   "name": "Pendant",
+   "pos": [
+    -1.3,
+    1.9,
+    -1.95
+   ],
+   "radius": 0.1,
+   "color": [
+    1,
+    0.8,
+    0.55
+   ],
+   "intensity": 60
+  },
+  {
+   "name": "Window fill",
+   "pos": [
+    -2.15,
+    1.6,
+    -0.9
+   ],
+   "radius": 0.2,
+   "color": [
+    0.65,
+    0.78,
+    1
+   ],
+   "intensity": 16
+  }
+ ],
+ "random_bbox": [
+  [
+   -2.3,
+   0.3,
+   -2.2
+  ],
+  [
+   -0.4,
+   2.4,
+   -0.3
+  ]
+ ],
+ "first_seg": 1,
+ "network": {
+  "width": 128,
+  "hidden": 4,
+  "feats": 2,
+  "grid_res": [
+   16,
+   20,
+   25,
+   32,
+   40,
+   50,
+   64,
+   80,
+   101,
+   128,
+   161,
+   203,
+   256,
+   322,
+   406,
+   512
+  ],
+  "aux_dim": 7,
+  "light_dim": 4,
+  "geo": true,
+  "head": "mul",
+  "light_grid": 0,
+  "light_grid_res": [],
+  "light_grid_feats": 0
+ },
+ "model": {
+  "grids": [
+   {
+    "offset": 0,
+    "dtype": "float16",
+    "shape": [
+     16,
+     16,
+     2
+    ]
+   },
+   {
+    "offset": 1024,
+    "dtype": "float16",
+    "shape": [
+     20,
+     20,
+     2
+    ]
+   },
+   {
+    "offset": 2624,
+    "dtype": "float16",
+    "shape": [
+     25,
+     25,
+     2
+    ]
+   },
+   {
+    "offset": 5136,
+    "dtype": "float16",
+    "shape": [
+     32,
+     32,
+     2
+    ]
+   },
+   {
+    "offset": 9232,
+    "dtype": "float16",
+    "shape": [
+     40,
+     40,
+     2
+    ]
+   },
+   {
+    "offset": 15632,
+    "dtype": "float16",
+    "shape": [
+     50,
+     50,
+     2
+    ]
+   },
+   {
+    "offset": 25632,
+    "dtype": "float16",
+    "shape": [
+     64,
+     64,
+     2
+    ]
+   },
+   {
+    "offset": 42016,
+    "dtype": "float16",
+    "shape": [
+     80,
+     80,
+     2
+    ]
+   },
+   {
+    "offset": 67616,
+    "dtype": "float16",
+    "shape": [
+     101,
+     101,
+     2
+    ]
+   },
+   {
+    "offset": 108432,
+    "dtype": "float16",
+    "shape": [
+     128,
+     128,
+     2
+    ]
+   },
+   {
+    "offset": 173968,
+    "dtype": "float16",
+    "shape": [
+     161,
+     161,
+     2
+    ]
+   },
+   {
+    "offset": 277664,
+    "dtype": "float16",
+    "shape": [
+     203,
+     203,
+     2
+    ]
+   },
+   {
+    "offset": 442512,
+    "dtype": "float16",
+    "shape": [
+     256,
+     256,
+     2
+    ]
+   },
+   {
+    "offset": 704656,
+    "dtype": "float16",
+    "shape": [
+     322,
+     322,
+     2
+    ]
+   },
+   {
+    "offset": 1119392,
+    "dtype": "float16",
+    "shape": [
+     406,
+     406,
+     2
+    ]
+   },
+   {
+    "offset": 1778736,
+    "dtype": "float16",
+    "shape": [
+     512,
+     512,
+     2
+    ]
+   }
+  ],
+  "layers": [
+   {
+    "weight": {
+     "offset": 2827312,
+     "dtype": "float32",
+     "shape": [
+      128,
+      49
+     ]
+    },
+    "bias": {
+     "offset": 2852400,
+     "dtype": "float32",
+     "shape": [
+      128
+     ]
+    }
+   },
+   {
+    "weight": {
+     "offset": 2852912,
+     "dtype": "float32",
+     "shape": [
+      128,
+      128
+     ]
+    },
+    "bias": {
+     "offset": 2918448,
+     "dtype": "float32",
+     "shape": [
+      128
+     ]
+    }
+   },
+   {
+    "weight": {
+     "offset": 2918960,
+     "dtype": "float32",
+     "shape": [
+      128,
+      128
+     ]
+    },
+    "bias": {
+     "offset": 2984496,
+     "dtype": "float32",
+     "shape": [
+      128
+     ]
+    }
+   },
+   {
+    "weight": {
+     "offset": 2985008,
+     "dtype": "float32",
+     "shape": [
+      128,
+      128
+     ]
+    },
+    "bias": {
+     "offset": 3050544,
+     "dtype": "float32",
+     "shape": [
+      128
+     ]
+    }
+   },
+   {
+    "weight": {
+     "offset": 3051056,
+     "dtype": "float32",
+     "shape": [
+      6,
+      128
+     ]
+    },
+    "bias": {
+     "offset": 3054128,
+     "dtype": "float32",
+     "shape": [
+      6
+     ]
+    }
+   }
+  ],
+  "light_grids": []
+ },
+ "pixels": {
+  "format": 2,
+  "aux": {
+   "offset": 0,
+   "bytes": 8257536,
+   "channels": 7
+  },
+  "pos": {
+   "offset": 8257536,
+   "bytes": 3538944,
+   "channels": 3,
+   "range": [
+    -2.899231267929077,
+    2.7375455627441405
+   ]
+  }
+ },
+ "refs": [],
+ "train": {
+  "spp": 128,
+  "max_seg": 6,
+  "iters": 100000,
+  "log": [
+   {
+    "it": 100000,
+    "loss": 0.0028677210211753845,
+    "psnr_den": 56.762436389923096,
+    "psnr_raw": 46.525328636169434,
+    "time": 1184.8375220298767
+   }
+  ]
+ }
+}

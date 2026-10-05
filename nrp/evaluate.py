@@ -27,17 +27,15 @@ from direct import direct_view
 from gather import PathData, gather_arrays
 from model import NRP, PixelBuffers, predict_image
 
-VIEWER_TESTS = [[0.0, 0.75, 0.0, 0.15], [-0.55, 0.1, 0.45, 0.12], [0.6, -0.1, 0.6, 0.08],
-                [0.0, 0.2, 1.6, 0.3], [0.35, -0.2, 0.3, 0.07], [-0.1, -0.85, -0.6, 0.1]]
-
-
 def eval_lights(meta, n, seed):
+    """The scene's viewer test lights followed by n random ones."""
     g = torch.Generator().manual_seed(seed)
     lo, hi = torch.tensor(meta["light_bbox"][0]), torch.tensor(meta["light_bbox"][1])
     rmin, rmax = meta["radius_range"]
     c = lo + (hi - lo) * torch.rand(n, 3, generator=g)
     r = rmin + (rmax - rmin) * torch.rand(n, 1, generator=g)
-    return torch.cat([torch.tensor(VIEWER_TESTS), torch.cat([c, r], -1)]).cuda()
+    tests = torch.tensor(scenes.SCENES[meta["scene"]]["test_lights"])
+    return torch.cat([tests, torch.cat([c, r], -1)]).cuda()
 
 
 @torch.no_grad()

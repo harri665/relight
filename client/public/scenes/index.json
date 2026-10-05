@@ -1,5 +1,19 @@
 [
  {
+  "name": "bathroom",
+  "label": "Bathroom \u00b7 fast (128\u00d74)",
+  "network": "128x4",
+  "tiers": [
+   384,
+   768
+  ]
+ },
+ {
+  "name": "bathroom-hq",
+  "label": "Bathroom \u00b7 quality (256\u00d74)",
+  "network": "256x4"
+ },
+ {
   "name": "cornell",
   "label": "Cornell \u00b7 fast (128\u00d74)",
   "network": "128x4",

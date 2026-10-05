@@ -12,7 +12,7 @@ Relight a path-traced scene in the browser in milliseconds. This is a re-impleme
 - **Paint & Optimize:** paint the lighting you want, or load a target image, and gradient descent moves the lights to match
 - **Accuracy tab:** compare the network against path-traced references for held-out lights
 - WebGPU, with an automatic WebGL2 fallback for browsers without it (most phones)
-- Two shipped models for the Cornell box: fast (128×4) and quality (256×4)
+- Two scenes, each with a fast (128×4) and a quality (256×4) model: the Cornell box, and a bathroom with a mirror, glossy tiles and window blinds
 
 ## Quick start
 
@@ -24,7 +24,7 @@ npm run install:all
 npm run dev              # open http://localhost:5173
 ```
 
-The trained Cornell box models are included in `client/public/scenes/`, so no Python is needed to run the viewer.
+The trained models are included in `client/public/scenes/`, so no Python is needed to run the viewer. Pick a scene in the header, or open `?scene=bathroom-hq`.
 
 ### Other ways to run it
 
@@ -79,6 +79,8 @@ python export.py --run cornell_geo_128x4 --name cornell         # add --res N fo
 python evaluate.py --runs cornell_geo_128x4                     # optional: score against 1024-spp references
 ```
 
+The same steps with `--scene bathroom` build the bathroom ('Contemporary Bathroom' by Mareck, CC0, via [Bitterli's rendering resources](https://benedikt-bitterli.me/resources/)). `scenes.py` downloads it into `relight-work\assets` on first use and strips its light. Each scene sets its light domain, test lights, the viewer's starting lights and the region for random lights in `scenes.py`.
+
 Exports store their per-pixel buffers packed (16-bit positions, each row as differences), which gzip shrinks about 4.5x more than the old float layout. An export from before this can be repacked in place with `python pixels.py <web scene folder>`; the viewer reads both.
 
 ## Project layout
@@ -115,12 +117,16 @@ server/                     Express health-check API (the viewer itself is stati
 
 ## Accuracy
 
-Scored by `evaluate.py` against denoised 1024-spp references on 37 lights:
+Scored by `evaluate.py` against denoised 1024-spp references on each scene's 6 test lights plus 31 (Cornell) or 32 (bathroom) random ones:
 
 | model | PSNR | relative error | worst 5 lights | per light (RTX 3080, 512²) |
 |---|---|---|---|---|
 | `cornell` (fast, 128×4) | 44.0 dB | 4.4 % | 32.5 dB | 4.8 ms |
 | `cornell-hq` (quality, 256×4) | 46.2 dB | 3.5 % | 34.1 dB | 17.1 ms |
+| `bathroom` (fast, 128×4) | 36.7 dB | 22.3 % | 22.6 dB | 4.8 ms |
+| `bathroom-hq` (quality, 256×4) | 38.7 dB | 11.5 % | 28.9 dB | 17.1 ms |
+
+The bathroom is limited mostly by its training targets: denoised 128-spp gathers score only 39.9 dB there (52.4 dB on Cornell), because the mirror, glossy tiles and blinds make the paths noisy. Its quality model is the one to use.
 
 ![Proxy, reference and error for a light behind the tall box](docs/relight-accuracy-t6.webp)
 

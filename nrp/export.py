@@ -18,6 +18,7 @@ import json
 import numpy as np
 import torch
 
+import scenes
 from common import WEB_SCENES_DIR, WORK_DIR
 from direct import direct_view
 from model import NRP, PixelBuffers
@@ -54,6 +55,7 @@ def main():
     ck = torch.load(WORK_DIR / "runs" / args.run / "model.pt", weights_only=False)
     meta, cfg = ck["meta"], ck["cfg"]
     name = args.name or meta["scene"]
+    scene_cfg = scenes.SCENES[meta["scene"]]
     out = WEB_SCENES_DIR / name
     out.mkdir(parents=True, exist_ok=True)
 
@@ -76,7 +78,6 @@ def main():
 
     # Per-pixel buffers.
     if tier:
-        import scenes
         from sample_paths import render_aux
         albedo, normal, pos, dist = render_aux(scenes.load(meta["scene"], tier)[0], spp=64)
         aux = torch.from_numpy(np.concatenate([albedo, normal, pos, dist], -1).astype(np.float32)).cuda()
@@ -97,14 +98,7 @@ def main():
     else:
         from denoise import make_denoiser
         den = make_denoiser(aux[..., 0:3], aux[..., 3:6])
-    test_lights = torch.tensor([
-        [0.0, 0.75, 0.0, 0.15],
-        [-0.55, 0.1, 0.45, 0.12],
-        [0.6, -0.1, 0.6, 0.08],
-        [0.0, 0.2, 1.6, 0.3],
-        [0.35, -0.2, 0.3, 0.07],   # just above the glass ball
-        [-0.1, -0.85, -0.6, 0.1],  # behind the tall box, near the floor
-    ], device="cuda")[:args.refs]
+    test_lights = torch.tensor(scene_cfg["test_lights"], device="cuda")[:args.refs]
     rb = Blob()
     fs = meta.get("first_seg", 0)
     refs = []
@@ -121,6 +115,8 @@ def main():
         "name": name, "width": W, "height": H,
         "camera": meta["camera"],
         "light_bbox": meta["light_bbox"], "radius_range": meta["radius_range"],
+        "default_lights": scene_cfg.get("default_lights"),
+        "random_bbox": scene_cfg.get("random_bbox"),
         "first_seg": fs,
         "network": {"width": cfg["width"], "hidden": cfg["hidden"], "feats": cfg["feats"],
                     "grid_res": model.enc.res, "aux_dim": cfg.get("aux_dim", 7), "light_dim": 4,
