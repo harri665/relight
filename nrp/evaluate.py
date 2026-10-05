@@ -7,6 +7,8 @@ the stored --spp dump), i.e. the floor that supervision quality puts on a model.
 
 Images are exposure-normalised like the viewer (reference mean luminance 0.15),
 then compared in Reinhard-tonemapped space (PSNR) and linear space (relative MAE).
+The average hides dark regions (shadows, indirect light, dim lights), so it also reports
+relative MAE over the darkest quarter of each reference and PSNR at +3 EV (exposure x 8).
 
     python evaluate.py --runs cornell_128x4 cornell_256x4
 """
@@ -58,12 +60,16 @@ def reference(scene_name, meta, lights, spp, chunk=16):
 
 
 def metrics(img, ref):
-    """img, ref: [NP, 3] linear. Exposure-normalised tonemapped PSNR and relative MAE."""
-    lum = lambda x: (x * torch.tensor([0.2126, 0.7152, 0.0722], device=x.device)).sum(-1).mean()
-    s = 0.15 / lum(ref).clamp_min(1e-8)
-    tm = lambda x: (x * s).clamp_min(0) / (1 + (x * s).clamp_min(0))
-    mse = ((tm(img) - tm(ref)) ** 2).mean()
-    return (-10 * torch.log10(mse)).item(), ((img - ref).abs().sum() / ref.abs().sum()).item()
+    """img, ref: [NP, 3] linear. Exposure-normalised tonemapped PSNR, relative MAE, relative MAE
+    over the darkest 25 % of the reference's pixels, and tonemapped PSNR at +3 EV."""
+    Y = lambda x: (x * torch.tensor([0.2126, 0.7152, 0.0722], device=x.device)).sum(-1)
+    s = 0.15 / Y(ref).mean().clamp_min(1e-8)
+    tm = lambda x, k: (x * s * k).clamp_min(0) / (1 + (x * s * k).clamp_min(0))
+    psnr = lambda k: (-10 * torch.log10(((tm(img, k) - tm(ref, k)) ** 2).mean())).item()
+    rel = lambda m: ((img[m] - ref[m]).abs().sum() / ref[m].abs().sum().clamp_min(1e-12)).item()
+    yr = Y(ref)
+    dark = yr <= torch.quantile(yr, 0.25)
+    return psnr(1), rel(slice(None)), rel(dark), psnr(8)
 
 
 def main():
@@ -113,14 +119,18 @@ def main():
         bufs = PixelBuffers(aux, ck["meta"], aux_dim=ck["cfg"].get("aux_dim", 7))
         results[run] = [metrics(predict_image(model, bufs, l) + d, r) for l, d, r in zip(lights, directs, ref)]
 
-    print(f"\n{'':44s} {'PSNR all':>9s} {'viewer tests 1..6 (dB)':>40s} {'rel.MAE':>8s} {'worst 5 mean':>13s}")
+    print(f"\n{'':44s} {'PSNR all':>9s} {'viewer tests 1..6 (dB)':>40s} {'rel.MAE':>8s} {'worst 5 mean':>13s}"
+          f" {'dark rel.MAE':>13s} {'PSNR +3EV':>10s}")
     summary = {}
     for name, m in results.items():
         p = np.array([x[0] for x in m]); e = np.array([x[1] for x in m])
+        ed = np.array([x[2] for x in m]); p8 = np.array([x[3] for x in m])
         tests = " ".join(f"{x:5.1f}" for x in p[:6])  # all six viewer tests are valid lights
         worst = np.sort(p)[:5].mean()
-        print(f"{name:44s} {p.mean():8.2f}  {tests:>40s} {100 * e.mean():7.1f}% {worst:12.2f}")
-        summary[name] = {"psnr_mean": float(p.mean()), "psnr": p.tolist(), "rel_mae_mean": float(e.mean()), "worst5": float(worst)}
+        print(f"{name:44s} {p.mean():8.2f}  {tests:>40s} {100 * e.mean():7.1f}% {worst:12.2f}"
+              f" {100 * ed.mean():12.1f}% {p8.mean():10.2f}")
+        summary[name] = {"psnr_mean": float(p.mean()), "psnr": p.tolist(), "rel_mae_mean": float(e.mean()), "worst5": float(worst),
+                         "dark_rel_mae_mean": float(ed.mean()), "psnr_3ev_mean": float(p8.mean())}
     (WORK_DIR / "eval.json").write_text(json.dumps(summary, indent=1))
 
 

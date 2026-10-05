@@ -131,6 +131,9 @@ def main():
     ap.add_argument("--light-grid", type=int, default=0, help="levels of a 3D grid encoding of the light position")
     ap.add_argument("--adapt", type=float, default=0.0,
                     help="fraction of training lights drawn in proportion to the running loss per light-domain cell")
+    ap.add_argument("--rel-eps", type=float, default=0.01,
+                    help="relative MSE: (pred - target)^2 / (pred^2 + rel_eps). Targets are transport per unit "
+                         "radiance (median ~1e-3), so 0.01 makes this plain MSE for nearly every pixel")
     ap.add_argument("--first-seg", type=int, default=1,
                     help="1: network skips segment 0 (direct view, added analytically); 0: paper setup")
     args = ap.parse_args()
@@ -218,7 +221,7 @@ def main():
         k = torch.randint(0, args.pool, (args.batch,), device="cuda")
         target = pool[k, pix].float()
         pred = run_model(model, bufs, pix, pool_lights[k])
-        per = (pred - target) ** 2 / (pred.detach() ** 2 + 0.01)
+        per = (pred - target) ** 2 / (pred.detach() ** 2 + args.rel_eps)
         loss = per.mean()
         if args.adapt > 0:
             with torch.no_grad():
