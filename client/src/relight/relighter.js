@@ -1,8 +1,12 @@
 // The viewer's runtime: owns the engine, the lights, the render loop and the viewport canvases.
 // React components read its fields directly and re-render on emit() (see useRelighter.js).
 // It lives for the whole page load, so leaving the viewer route does not reload the scene.
-import { NRPEngine, GLEngine, LightOptimizer, MAX_LIGHTS, discPixels } from "../engine/nrp.js";
+import { NRPEngine, GLEngine, LightOptimizer, MAX_LIGHTS, SPARE, discPixels } from "../engine/nrp.js";
+import { MIN_BAND_ROWS } from "../engine/engine-base.js";
 import { hexToRgb, rgbToHex, srgbToLin, fmt } from "./color.js";
+import {
+  AdaptiveQuality, previewStride, refineStride, benchStride, gpuName, loadProfile, saveProfile, seedCosts, measuredCosts,
+} from "./quality.js";
 
 const params = new URLSearchParams(location.search);
 // Without ?scene=, the first load picks "cornell" or else the first scene in the index (see resolveScene).
@@ -11,11 +15,18 @@ export const BACKEND = params.get("backend");  // "webgpu" or "webgl" forces one
 export const RES = Number(params.get("res")) || null;  // alternative image size, see export.py --res
 export { MAX_LIGHTS };
 
-// While lights change, a light whose full-resolution evaluation would not fit the frame budget is
-// evaluated on every s-th pixel instead (a preview, upsampled along the geometry by the composite).
-// Once nothing has changed for REFINE_MS, previews are re-evaluated at full resolution.
-// Fast GPUs stay at full resolution throughout.
-const FRAME_BUDGET_MS = 30, REFINE_MS = 150;
+// While lights change, a light whose full-resolution evaluation would not fit the network's budget for
+// a frame (quality.js) is evaluated on every s-th pixel instead (a preview, upsampled along the
+// geometry by the composite). Once nothing has changed for REFINE_DELAY_MS, previews are refined, a
+// band of rows a frame within the budget, into the spare slot, which then takes the light's place.
+// Fast GPUs stay at full resolution throughout; slow ones stop at the stride they can refine to.
+const REFINE_DELAY_MS = 120;
+// While the lights rest, a light is timed at the finest stride the GPU can take (benchStride), at
+// most BENCH_LIMIT times an engine.
+const BENCH_REST_MS = 500, BENCH_LIMIT = 16;
+// The budget only follows late frames once the scene has run this long (loading made frames late).
+const SETTLE_MS = 1500;
+const SAVE_EVERY_MS = 5000;
 
 // Engines own the canvas context, so switching backend or scene reloads the page. Lights, exposure
 // and selection are carried over in sessionStorage so both backends can be compared on the same lighting.
@@ -76,7 +87,13 @@ class Relighter {
     this.started = false;
     this.raf = 0;
     this.frames = 0; this.lastFps = performance.now();
-    this.lastChange = 0; this.sinceProbe = 0;
+    this.lastChange = 0; this.lastFrame = 0;
+    // the slot a resting light is refined into (see refine), and that refinement
+    this.spare = SPARE;
+    this.refining = null;
+    this.quality = new AdaptiveQuality();
+    this.gpu = null;
+    this.savedAt = 0;
     this.loop = this.loop.bind(this);
     this.resizeObserver = new ResizeObserver(() => this.resizeOverlay());
   }
@@ -158,6 +175,13 @@ class Relighter {
     this.W = engine.W; this.H = engine.H; this.NP = engine.NP;
     this.paint.canvas.width = this.W; this.paint.canvas.height = this.H;
     this.paint.ctx = this.paint.canvas.getContext("2d", { willReadFrequently: true });
+    // What an earlier visit learned on this GPU: the network's budget and its costs.
+    this.gpu = gpuName() || this.stats.gpu;
+    this.profile = loadProfile(this.gpu);
+    this.quality = new AdaptiveQuality({ budget: this.profile?.budget });
+    seedCosts(engine, this.profile);
+    this.readyAt = performance.now();
+    addEventListener("pagehide", () => this.saveProfile());
     this.status = { phase: "ready", message: "" };
     this.setExposure(this.ui.exposure);
     if (!this.restoreCarried()) this.defaultLights();
@@ -197,12 +221,14 @@ class Relighter {
   removeLight(i) {
     const { state } = this;
     const [l] = state.lights.splice(i, 1);
+    if (this.refining?.light === l) this.refining = null;
     state.freeSlots.push(l.slot);
     state.sel = Math.min(state.sel, state.lights.length - 1);
     this.onLightsChanged();
   }
   setLights(list) {
     const { state } = this;
+    this.refining = null;
     state.lights.forEach((l) => state.freeSlots.push(l.slot));
     state.lights = [];
     list.forEach((o) => { const l = this.makeLight(o); if (l) { this.engine.clampLight(l); state.lights.push(l); } });
@@ -214,9 +240,10 @@ class Relighter {
   }
   restoreLights(snap) {
     const { state } = this;
+    this.refining = null;
     state.lights.forEach((l) => state.freeSlots.push(l.slot));
-    state.freeSlots = state.freeSlots.filter((s) => !snap.some((l) => l.slot === s));
-    state.lights = snap.map((l) => ({ ...l, pos: [...l.pos], color: [...l.color], dirty: true }));
+    // slots move between lights and the spare as lights are refined, so each gets a free one again
+    state.lights = snap.map((l) => ({ ...l, pos: [...l.pos], color: [...l.color], slot: state.freeSlots.pop(), dirty: true }));
     state.sel = Math.min(state.sel, state.lights.length - 1);
     this.onLightsChanged();
   }
@@ -496,6 +523,7 @@ class Relighter {
     lights.forEach((l) => (l.optimize = !ui.optSelected || l === this.selected));
     // Current rendering (display space, full resolution) is the base of the target.
     this.setViewMode(0);
+    this.refining = null;
     this.sharpen();
     engine.render(state.lights);
     const base = await engine.readDisplay();
@@ -628,52 +656,97 @@ class Relighter {
   }
 
   // ---------------------------------------------------------------- adaptive resolution
-  previewStride(nDirty) {
-    const engine = this.engine;
-    if (engine.evalCost(1) == null) return 8;  // nothing measured yet: start with the cheapest preview
-    const cost = (s) => nDirty * engine.evalCost(s);
-    let s = [1, 2, 4].find((k) => cost(k) <= FRAME_BUDGET_MS) ?? 8;
-    // Predictions for finer strides go stale, e.g. when they were measured while the GPU was clocked
-    // down, and light preview work never clocks it up. So every few frames, try the next finer stride
-    // if it is plausibly close to the budget.
-    if (s > 1 && ++this.sinceProbe >= 8 && cost(s / 2) <= 3 * FRAME_BUDGET_MS) { this.sinceProbe = 0; s /= 2; }
-    return s;
-  }
-  /** Marks dirty lights for a preview-resolution evaluation where needed. */
+  /** Marks dirty lights for a preview-resolution evaluation that fits the budget between them. */
   planPreview() {
     const dirty = this.state.lights.filter((l) => l.dirty);
     if (!dirty.length) return;
-    const s = this.previewStride(dirty.length);
+    const s = previewStride(this.engine, this.quality.budget / dirty.length);
     dirty.forEach((l) => (l.stride = s));
+    if (dirty.includes(this.refining?.light)) this.refining = null;
     this.lastChange = performance.now();
   }
-  /** Marks every preview-resolution light for re-evaluation at full resolution. */
+  /** Marks every preview-resolution light for re-evaluation at full resolution (all at once). */
   sharpen() {
     let n = 0;
     for (const l of this.state.lights) if (l.stride > 1) { l.stride = 1; l.dirty = true; n++; }
     return n;
   }
 
+  /**
+   * Refines a resting light a band of rows a frame, as far as the budget allows (refineStride), into
+   * the spare slot while its own slot stays on screen; when the band reaches the bottom the two swap.
+   * Returns whether the network ran.
+   */
+  refine(now) {
+    const { engine, quality } = this;
+    if (now - this.lastChange < REFINE_DELAY_MS) return false;
+    const finest = refineStride(engine, quality.budget);
+    let job = this.refining;
+    if (job && (job.stride !== finest || !this.state.lights.includes(job.light))) job = null;
+    if (!job) {
+      const light = this.state.lights.find((l) => l.enabled && (l.stride || 1) > finest);
+      if (!light) return false;
+      job = this.refining = { light, stride: finest, row: 0 };
+    }
+    const rows = engine.rows(finest), cols = engine.cols(finest);
+    const cost = engine.evalCost(finest), rowCost = cost && cost * engine.share(finest, 0, 1, 0, cols);
+    const band = rowCost ? Math.floor(quality.budget / rowCost / 4) * 4 : MIN_BAND_ROWS;
+    const to = Math.min(rows, job.row + Math.max(MIN_BAND_ROWS, band));
+    engine.evaluate(job.light, this.spare, finest, job.row, to);
+    job.row = to;
+    if (to >= rows) {
+      [job.light.slot, this.spare] = [this.spare, job.light.slot];
+      job.light.stride = finest;
+      this.refining = null;
+      engine.composite(this.state.lights);
+    }
+    return true;
+  }
+
+  /** While the lights rest, times a light at the finest stride the GPU can take (see benchStride). */
+  bench(now) {
+    const { engine } = this;
+    if (this.refining || engine.timing.pending || (engine.benchRuns ?? 0) >= BENCH_LIMIT) return false;
+    if (now - this.lastChange < BENCH_REST_MS) return false;
+    const stride = benchStride(engine);
+    if (!stride) return false;
+    engine.benchRuns = (engine.benchRuns ?? 0) + 1;
+    engine.evaluate(engine.midLight(), this.spare, stride);
+    return true;
+  }
+
+  saveProfile() {
+    const { engine, quality } = this;
+    if (!engine || !Object.keys(engine.timing.byStride).length) return;
+    saveProfile({ gpu: this.gpu, fps: 30, ...measuredCosts(engine), budget: quality.budget });
+  }
+
   // ---------------------------------------------------------------- main loop
-  loop() {
-    const { engine, state } = this;
-    const now = performance.now();
+  loop(now = performance.now()) {
+    const { engine, state, quality } = this;
+    const delta = this.lastFrame ? (now - this.lastFrame) / 1000 : 0;
+    this.lastFrame = now;
     if (this.ready) {
       engine.pollTiming();
+      quality.frame(delta, now - this.readyAt > SETTLE_MS, state.optimizing);
+      let worked = false;
       if (state.needsRender) {
         state.needsRender = false;
         this.planPreview();
+        worked = state.lights.some((l) => l.dirty);
         engine.render(state.lights);
         this.drawOverlay();
         this.frames++;
-      } else if (!state.optimizing && now - this.lastChange > REFINE_MS && this.sharpen()) {
-        engine.render(state.lights);
-        this.frames++;
+      } else if (!state.optimizing) {
+        worked = this.refine(now) || this.bench(now);
+        if (worked) this.frames++;
       }
+      if (worked) quality.worked();
+      if (now - this.savedAt > SAVE_EVERY_MS) { this.savedAt = now; this.saveProfile(); }
     }
     if (now - this.lastFps > 500) {
       this.stats.fps = this.frames ? Math.round((this.frames * 1000) / (now - this.lastFps)) : null;
-      if (engine?.evalCost(1)) this.stats.perLight = engine.evalCost(1);
+      this.stats.perLight = engine?.evalCost(1) ?? null;
       this.frames = 0; this.lastFps = now;
       this.emit();
     }

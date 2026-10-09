@@ -260,6 +260,30 @@ export class EngineBase {
     return Math.min(...known.map((k) => t[k] * (k / s) ** 2));
   }
 
+  /** A light in the middle of the light box. */
+  midLight() {
+    return { pos: [0, 1, 2].map((i) => (this.lo[i] + this.hi[i]) / 2), radius: (this.rmin + this.rmax) / 2 };
+  }
+
+  /**
+   * The finest stride (1, 2, 4 or 8) a light can be evaluated at within `ms`, from an untimed run at
+   * stride 4 (after one that sets the pipeline up). Kernels are tuned at it: at full resolution a
+   * slow GPU took seconds.
+   */
+  async affordableStride(ms = 30) {
+    const light = this.midLight();
+    let t = 0;
+    await this.untimed(async () => {
+      this.evaluate(light, SPARE, 4);
+      await this.finish();
+      const t0 = performance.now();
+      this.evaluate(light, SPARE, 4);
+      await this.finish();
+      t = performance.now() - t0;
+    });
+    return [1, 2, 4].find((s) => t * (4 / s) ** 2 <= ms) ?? 8;
+  }
+
   /** Runs `fn` (which evaluates) without its timings reaching the cost model. */
   async untimed(fn) {
     const saved = this.timing;

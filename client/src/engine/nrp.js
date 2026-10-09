@@ -203,7 +203,7 @@ export class NRPEngine extends EngineBase {
     this.tuned = !!known || forced || this.kernels.length < 2;
     if (!this.tuned) {
       onProgress("timing kernel shapes");
-      await this.tune();
+      await this.tune(await this.affordableStride());
       rememberKernel(this.kernelStore, kernelKey(this.kernel));
     }
 
@@ -244,7 +244,7 @@ export class NRPEngine extends EngineBase {
    * `stride`), and keeps the fastest.
    */
   async tune(stride = 1, runs = 3) {
-    const light = { pos: [0, 1, 2].map((i) => (this.lo[i] + this.hi[i]) / 2), radius: (this.rmin + this.rmax) / 2 };
+    const light = this.midLight();
     const done = () => this.device.queue.onSubmittedWorkDone();
     const times = {};
     let best = null;

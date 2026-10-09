@@ -469,7 +469,7 @@ export class GLEngine extends EngineBase {
     this.tuned = known !== undefined || forced || this.outOptions.length < 2;
     if (!this.tuned) {
       onProgress("timing shader passes");
-      await this.tune();
+      await this.tune(await this.affordableStride());
       rememberKernel(this.kernelStore, this.kernelName);
     }
     return scene;
@@ -548,7 +548,7 @@ export class GLEngine extends EngineBase {
 
   /** Times each output count on a light in the middle of the box (in the spare slot, at `stride`), and keeps the fastest. */
   async tune(stride = 1, runs = 3) {
-    const light = { pos: [0, 1, 2].map((i) => (this.lo[i] + this.hi[i]) / 2), radius: (this.rmin + this.rmax) / 2 };
+    const light = this.midLight();
     const times = {};
     let best = null;
     await this.untimed(async () => {
