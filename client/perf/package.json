@@ -1,0 +1,12 @@
+{
+  "name": "relight-perf",
+  "private": true,
+  "description": "Times the viewer's network and scores it against the path-traced references (relight-bench.mjs)",
+  "type": "module",
+  "scripts": {
+    "bench": "node relight-bench.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.63.0"
+  }
+}

@@ -51,12 +51,22 @@ On Windows, `lan` and `https` need Windows Firewall to allow Node on the network
 | parameter | effect |
 |---|---|
 | `?backend=webgpu` / `?backend=webgl` | force a backend (the header switch does the same and keeps your lights) |
-| `?res=384` / `?res=768` | use a smaller or larger export of the scene (smaller is faster on weak GPUs; reference renders exist only at native size) |
+| `?res=384` / `?res=768` / `?res=native` | pin an image size instead of letting the viewer choose (see below; reference renders exist only at native size) |
 | `?kernel=128x4` / `?kernel=o2` | force how the network runs: a WebGPU kernel shape (threads × pixels per thread) or WebGL2 output groups per pass; `?kernel=tune` times them again |
+| `?bench` | no viewer; `window.__relightBench` for `client/perf/relight-bench.mjs` |
 
-On slow GPUs, a moving light is previewed on every 2nd, 4th or 8th pixel, chosen from measured timings, and refined to full resolution about 150 ms after it stops.
+The viewer fits itself to the GPU. How long the network may run each frame (its budget) grows while the page holds 30 fps and backs off when frames with network work run late. A moving light is previewed on the finest grid of pixels (every 2nd, 4th, 8th...) that fits the budget, and once it stops it is refined a band of rows a frame, as far as about 40 frames of budget allow. Without `?res`, the image size follows the GPU too: a first visit starts at the native size (the smallest on phones), a larger size is loaded in the background if the GPU has room for it, and a scene the viewer picked itself switches to its lighter network (`cornell-lite`) on a GPU too slow for the 128-wide one. What it learns is kept per GPU for the next visit, and the Model tab shows it live. If WebGPU loses its device, the viewer carries on in WebGL2.
 
 On WebGPU the network runs in 16-bit floats where the GPU supports `shader-f16` (about a third faster, at most about 3/255 off), and at load the viewer times several kernel shapes and keeps the fastest (logged to the console). WebGL2 does the same for how many output groups each shader pass writes (on an RTX 3080, one a pass is about 30% faster than eight). The choice is remembered per GPU, so it is timed only on a first visit. Painting and optimizing stays in 32-bit floats.
+
+To time the network and score it against the path-traced references at each stride, size and backend, with the dev server running:
+
+```bash
+cd client/perf && npm install
+node relight-bench.mjs --url http://localhost:5173 --scenes cornell,cornell-lite --sizes native,768
+```
+
+On an RTX 3080, Cornell (128×4) at 512 px takes 3.2 ms a light on WebGPU and 18 ms on WebGL2, at 41.5 dB; every 4th pixel, 0.4 ms at 40.5 dB.
 
 ## Train your own models
 
