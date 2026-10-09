@@ -18,28 +18,31 @@
 //   [0] light center xyz, radius   [1].x slot (as float)   [2..] add
 //
 // Pixel geometry buffer pgeo (array<vec4f>, 2 per pixel): (position, camera distance; 0 = no hit),
-// (shading normal, 0).
+// (shading normal, 0). The precompute pass builds it and X from the scene's 16-bit pixel data.
+//
+// Display outputs (outB): a slot holds a light's items as halves, NW words an item: rgb, or with the
+// 'mul' head a and b of a * G + b.
 
 import { MAX_LIGHTS } from "./engine-base.js";
 export { MAX_LIGHTS };
 
 export function makeShaders(c) {
-  const { WD, NH, W, H, levels, feats, gridRes, gridOff, off, auxDim, geo, mul } = c;
+  const { WD, NH, W, H, levels, feats, gridRes, gridOff, off, auxDim, geo, mul, posRange, camO } = c;
   const CG = WD / 4;          // channel groups of 4 per row
   const PG = 256 / CG;        // pixel groups per workgroup
   const TP = PG * 4;          // pixels per workgroup tile
   const ENC = levels * feats;
   const PIXIN = ENC + auxDim;
-  const AUXS = Math.ceil(auxDim / 4) * 4;
   const XW = Math.ceil(PIXIN / 2);
   const IN = c.IN;
   const NP = W * H;
   const NO = mul ? 6 : 3;
-  const OUTV = mul ? 2 : 1;   // vec4s per item of the display output buffer (a, then b)
+  const NW = mul ? 3 : 2;     // u32 words (pairs of halves) per item of the display outputs
   const JOB = 2 + CG;
   const PS = WD + 8;          // per-tile partial sums: sum g0 [WD], dln extra [4], dE [3], loss
   const u = (x) => `${x >>> 0}u`;
   const arr = (a) => `array<u32, ${a.length}>(${a.map(u).join(", ")})`;
+  const f = (x) => (/[.e]/.test(`${x}`) ? `${x}` : `${x}.0`);
   const HSTRIDE = WD * WD + WD;
 
   const structs = /* wgsl */ `
@@ -174,14 +177,27 @@ fn directSoft(p: u32, l: u32) -> DGrad {
 `;
 
   // ---------------------------------------------------------------- precompute
+  // Each pixel's network inputs (grid encoding, then aux features) as f16 pairs into X, and its
+  // geometry into pgeo, from the 16-bit data as it ships: grid and aux as halves (aux in planes of 4
+  // channels), positions as 16-bit values over posRange from 1 (0 = the pixel sees nothing).
   const precompute = /* wgsl */ `
-@group(0) @binding(0) var<storage, read> grid: array<f32>;
-@group(0) @binding(1) var<storage, read> auxB: array<f32>;
-@group(0) @binding(2) var<storage, read_write> X: array<u32>;
+@group(0) @binding(0) var<storage, read> grid: array<u32>;
+@group(0) @binding(1) var<storage, read> auxB: array<u32>;
+@group(0) @binding(2) var<storage, read> posB: array<u32>;
+@group(0) @binding(3) var<storage, read_write> X: array<u32>;
+@group(0) @binding(4) var<storage, read_write> pgeo: array<vec4f>;
 var<private> RES: array<u32, ${levels}> = ${arr(gridRes)};
 var<private> GOFF: array<u32, ${levels}> = ${arr(gridOff)};
 const W = ${u(W)}; const H = ${u(H)}; const NP = ${u(NP)};
 const F = ${u(feats)};
+const POS_LO = ${f(posRange[0])}; const POS_STEP = ${f((posRange[1] - posRange[0]) / 65534)};
+const CAM_O = vec3f(${camO.map(f).join(", ")});
+
+fn gridAt(i: u32) -> f32 { return unpack2x16float(grid[i >> 1u])[i & 1u]; }
+fn auxAt(p: u32, j: u32) -> f32 {
+  let i = ((j >> 2u) * NP + p) * 4u + (j & 3u);
+  return unpack2x16float(auxB[i >> 1u])[i & 1u];
+}
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
@@ -197,15 +213,24 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let tx = fx - f32(x0); let ty = fy - f32(y0);
     let b = GOFF[l];
     for (var f = 0u; f < F; f++) {
-      let v00 = grid[b + (y0 * R + x0) * F + f];
-      let v01 = grid[b + (y0 * R + x0 + 1u) * F + f];
-      let v10 = grid[b + ((y0 + 1u) * R + x0) * F + f];
-      let v11 = grid[b + ((y0 + 1u) * R + x0 + 1u) * F + f];
+      let v00 = gridAt(b + (y0 * R + x0) * F + f);
+      let v01 = gridAt(b + (y0 * R + x0 + 1u) * F + f);
+      let v10 = gridAt(b + ((y0 + 1u) * R + x0) * F + f);
+      let v11 = gridAt(b + ((y0 + 1u) * R + x0 + 1u) * F + f);
       x[l * F + f] = mix(mix(v00, v01, tx), mix(v10, v11, tx), ty);
     }
   }
-  for (var j = 0u; j < ${u(auxDim)}; j++) { x[${u(ENC)} + j] = auxB[p * ${u(AUXS)} + j]; }
+  for (var j = 0u; j < ${u(auxDim)}; j++) { x[${u(ENC)} + j] = auxAt(p, j); }
   for (var j = 0u; j < ${u(XW)}; j++) { X[p * ${u(XW)} + j] = pack2x16float(vec2f(x[2u * j], x[2u * j + 1u])); }
+
+  let q0 = posB[2u * p]; let q1 = posB[2u * p + 1u];
+  var g = vec4f(0.0);
+  if ((q0 & 0xffffu) != 0u) {
+    let w = POS_LO + (vec3f(f32(q0 & 0xffffu), f32(q0 >> 16u), f32(q1 & 0xffffu)) - 1.0) * POS_STEP;
+    g = vec4f(w, length(w - CAM_O));
+  }
+  pgeo[2u * p] = g;
+  pgeo[2u * p + 1u] = vec4f(auxAt(p, 3u), auxAt(p, 4u), auxAt(p, 5u), 0.0);
 }
 `;
 
@@ -344,12 +369,16 @@ ${mlpBody(false)}
 
 
   // ------------------------------------------------------- fast forward (display path)
-  // The same network as `forward`, for evaluating lights to display, shaped by (threads, pixels):
+  // The same network as `forward`, for evaluating a light to display, shaped by (threads, pixels):
   // a thread computes 4 channels of `pixels` pixels, and reuses each weight it loads for all of
   // them. Activations are vec4s (a pixel's four channels in one workgroup-memory load), and with
   // `half` the arithmetic and workgroup memory are 16-bit floats from 16-bit weights (shader-f16).
   // Which shape is fastest depends on the GPU (NRPEngine.tune). The gradient path keeps `forward`:
   // its backward pass recomputes activations in f32.
+  //
+  // It evaluates items [i0, i1) of a band of the light's item grid at stride s: xw columns from
+  // column x0, so item i is (row i / xw, column x0 + i % xw), and writes them where they are in the
+  // slot's whole grid (ceil(W / s) columns).
   const fastForward = ({ threads, pixels: P, half }) => {
     const PGf = threads / CG, TPf = PGf * P;
     const Q = [...Array(P).keys()];
@@ -361,21 +390,24 @@ ${mlpBody(false)}
     const rows4 = (at) => [0, 1, 2, 3].map((j) => `let w${j} = Wv[${at} + ${u(j * CG)}];`).join(" ");
     return /* wgsl */ `
 ${half ? "enable f16;" : ""}
-struct FwdU { n: u32, subset: u32, stride: u32, slotStride: u32 };
+struct BandU { i0: u32, i1: u32, stride: u32, x0: u32, xw: u32, _a: u32, _b: u32, _c: u32 };
 @group(0) @binding(0) var<storage, read> Wv: array<${V}>;
 @group(0) @binding(1) var<storage, read> X: array<u32>;
 @group(0) @binding(2) var<storage, read> jobs: array<vec4f>;
-@group(0) @binding(3) var<uniform> fu: FwdU;
+@group(0) @binding(3) var<uniform> fu: BandU;
 @group(0) @binding(5) var<storage, read> pgeo: array<vec4f>;
-@group(0) @binding(6) var<storage, read_write> outB: array<f32>;
+@group(0) @binding(6) var<storage, read_write> outB: array<u32>;
+const NP = ${u(NP)};
 var<workgroup> act: array<${V}, ${TPf * CG}>;
 var<workgroup> pf: array<vec4f, ${2 * TPf}>;
 var<workgroup> res: array<f32, ${TPf * NO}>;
 ${geoFns}
 fn pixelOf(i: u32) -> u32 {
-  if (fu.stride <= 1u) { return i; }
+  return (i / fu.xw) * fu.stride * ${u(W)} + (fu.x0 + i % fu.xw) * fu.stride;
+}
+fn itemOf(i: u32) -> u32 {
   let cw = (${u(W)} + fu.stride - 1u) / fu.stride;
-  return (i / cw) * fu.stride * ${u(W)} + (i % cw) * fu.stride;
+  return (i / fu.xw) * cw + fu.x0 + i % fu.xw;
 }
 fn outRow(o: u32, pl: u32) -> f32 {
   var acc = f32(Wv[${u(off.BO / 4)} + o / 4u][o % 4u]);
@@ -388,8 +420,8 @@ fn outRow(o: u32, pl: u32) -> f32 {
 
 @compute @workgroup_size(${threads})
 fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) t: u32) {
-  let n = fu.n;
-  let base = wg.x * ${u(TPf)};
+  let n = fu.i1;
+  let base = fu.i0 + wg.x * ${u(TPf)};
   let pg = t / ${u(CG)};
   let cg = t % ${u(CG)};
   let jb = wg.y * ${u(JOB)};
@@ -453,17 +485,19 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) t: u3
     workgroupBarrier();
   }
 
-  // Output rows: rgb, or the 'mul' head's a and b as they are (two vec4s an item), which the
-  // composite puts together as a * G + b at every pixel (see netAt there)
+  // Output rows: rgb, or the 'mul' head's a and b as they are, which the composite puts together
+  // as a * G + b at every pixel (see netAt there)
   for (var e = t; e < ${u(TPf * NO)}; e += ${u(threads)}) {
     res[e] = outRow(e % ${u(NO)}, e / ${u(NO)});
   }
   workgroupBarrier();
   if (t < ${u(TPf)} && base + t < n) {
     let r = t * ${u(NO)};
-    let o = (u32(jobs[jb + 1u].x) * fu.slotStride + base + t) * ${u(4 * OUTV)};
-    outB[o] = res[r]; outB[o + 1u] = res[r + 1u]; outB[o + 2u] = res[r + 2u];
-    ${mul ? "outB[o + 4u] = res[r + 3u]; outB[o + 5u] = res[r + 4u]; outB[o + 6u] = res[r + 5u];" : ""}
+    let o = (u32(jobs[jb + 1u].x) * NP + itemOf(base + t)) * ${u(NW)};
+    outB[o] = pack2x16float(vec2f(res[r], res[r + 1u]));
+    ${mul ? `outB[o + 1u] = pack2x16float(vec2f(res[r + 2u], res[r + 3u]));
+    outB[o + 2u] = pack2x16float(vec2f(res[r + 4u], res[r + 5u]));`
+    : "outB[o + 1u] = pack2x16float(vec2f(res[r + 2u], 0.0));"}
   }
 }
 `;
@@ -472,7 +506,7 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) t: u3
   // ---------------------------------------------------------------- composite
   const composite = /* wgsl */ `
 @group(0) @binding(0) var<uniform> frame: Frame;
-@group(0) @binding(1) var<storage, read> outB: array<vec4f>;
+@group(0) @binding(1) var<storage, read> outB: array<u32>;
 @group(0) @binding(2) var<storage, read> pgeo: array<vec4f>;
 @group(0) @binding(3) var<storage, read> refB: array<vec4f>;
 @group(0) @binding(4) var<storage, read_write> disp: array<u32>;
@@ -490,7 +524,9 @@ ${geoFns}
 // The display kernel's output for item i: rgb (a), or with the 'mul' head a and b of a * G + b
 struct Net { a: vec3f, b: vec3f };
 fn outAt(i: u32) -> Net {
-  ${mul ? "return Net(outB[2u * i].xyz, outB[2u * i + 1u].xyz);" : "return Net(max(outB[i].xyz, vec3f(0.0)), vec3f(0.0));"}
+  let w0 = unpack2x16float(outB[${u(NW)} * i]); let w1 = unpack2x16float(outB[${u(NW)} * i + 1u]);
+  ${mul ? `let w2 = unpack2x16float(outB[${u(NW)} * i + 2u]);
+  return Net(vec3f(w0, w1.x), vec3f(w1.y, w2));` : "return Net(max(vec3f(w0, w1.x), vec3f(0.0)), vec3f(0.0));"}
 }
 // Light l's network output at pixel p. With the 'mul' head, G (the light's falloff and the surface's
 // angle to it) is computed here at the pixel itself, so a preview keeps the light's shape.
@@ -744,5 +780,5 @@ ${mlpBody(true)}
 }
 `;
 
-  return { precompute, forward, fastForward, XW, OUTV, composite, blit, lossPrep, grad, TP, CG, IN, PIXIN, JOB, PS, NO };
+  return { precompute, forward, fastForward, XW, NW, composite, blit, lossPrep, grad, TP, CG, IN, PIXIN, JOB, PS, NO };
 }

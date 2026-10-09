@@ -353,10 +353,8 @@ class Relighter {
         if (h !== state.hover) { state.hover = h; this.drawOverlay(); }
         const px = Math.floor(pt.x), py = Math.floor(pt.y);
         const p = Math.min(this.NP - 1, py * this.W + px);
-        const g = this.engine.geom;
-        this.flash(g[p * 4 + 3] > 0
-          ? `pixel ${px},${py} · surface (${fmt(g[p * 4])}, ${fmt(g[p * 4 + 1])}, ${fmt(g[p * 4 + 2])})`
-          : `pixel ${px},${py}`);
+        const surf = this.engine.surfaceAt(p);
+        this.flash(surf ? `pixel ${px},${py} · surface (${surf.pos.map((x) => fmt(x)).join(", ")})` : `pixel ${px},${py}`);
       }
     });
     const end = () => { state.drag = null; paint.drawing = false; };
@@ -369,12 +367,12 @@ class Relighter {
       if (!this.ready || state.tab === "paint") return;
       const pt = this.eventToImage(e);
       const p = Math.floor(pt.y) * this.W + Math.floor(pt.x);
-      const g = this.engine.geom, n = this.engine.normal;
-      if (!(g[p * 4 + 3] > 0)) return;
+      const surf = this.engine.surfaceAt(p);
+      if (!surf) return;
       const l = this.selected ?? this.addLight({});
       if (!l) return;
       const off = l.radius + 0.06;
-      l.pos = [0, 1, 2].map((k) => g[p * 4 + k] + n[p * 3 + k] * off);
+      l.pos = surf.pos.map((x, k) => x + surf.normal[k] * off);
       this.touch(l);
     });
 
@@ -661,6 +659,7 @@ class Relighter {
     const { engine, state } = this;
     const now = performance.now();
     if (this.ready) {
+      engine.pollTiming();
       if (state.needsRender) {
         state.needsRender = false;
         this.planPreview();
@@ -674,7 +673,7 @@ class Relighter {
     }
     if (now - this.lastFps > 500) {
       this.stats.fps = this.frames ? Math.round((this.frames * 1000) / (now - this.lastFps)) : null;
-      if (engine?.timing.perLight) this.stats.perLight = engine.timing.perLight;
+      if (engine?.evalCost(1)) this.stats.perLight = engine.evalCost(1);
       this.frames = 0; this.lastFps = now;
       this.emit();
     }

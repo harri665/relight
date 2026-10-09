@@ -1,5 +1,17 @@
-// Backend-independent parts of the runtime: scene loading, camera maths, light normalisation.
+// Backend-independent parts of the runtime: scene loading, camera maths, light normalisation and
+// the cost model the runtime schedules evaluations with.
 export const MAX_LIGHTS = 8;
+// Output slots: one a light, and a spare. A resting light is refined into the spare while its own
+// slot stays on screen, and the two swap when the refinement is done (see Relighter.refine).
+export const SLOTS = MAX_LIGHTS + 1;
+export const SPARE = MAX_LIGHTS;
+// Below this many rows a band's fixed cost outweighs its work (many times over on WebGL).
+export const MIN_BAND_ROWS = 16;
+// Thin bands make the GPU look slow: 16 rows at 768 px read ~16 ms for a light that takes ~8. Only
+// evaluations of at least this share of a light are timed.
+const MIN_TIMED_SHARE = 0.25;
+// ms of unpacking between yields to the page while a scene loads
+const SLICE_MS = 6;
 
 /**
  * How each engine runs the network best on this GPU (its kernel shape, tuned at load) is kept in
@@ -16,6 +28,11 @@ export function rememberKernel(key, name) {
   try { localStorage.setItem(key, name); } catch { /* not kept; it is timed again next visit */ }
 }
 
+const yieldChannel = new MessageChannel(), yieldWaiters = [];
+yieldChannel.port1.onmessage = () => yieldWaiters.shift()();
+/** Yields to the event loop for one task (unlike setTimeout, not clamped or throttled). */
+export const yieldTask = () => new Promise((r) => { yieldWaiters.push(r); yieldChannel.port2.postMessage(0); });
+
 export const f16tab = (() => {
   const t = new Float32Array(65536);
   for (let h = 0; h < 65536; h++) {
@@ -24,6 +41,27 @@ export const f16tab = (() => {
   }
   return t;
 })();
+
+/** float32 -> float16 bits, rounded to nearest even */
+export function toHalf(values) {
+  const out = new Uint16Array(values.length);
+  const f = new Float32Array(1), bits = new Uint32Array(f.buffer);
+  for (let k = 0; k < values.length; k++) {
+    f[0] = values[k];
+    const x = bits[0], sign = (x >>> 16) & 0x8000, e = ((x >>> 23) & 0xff) - 112;
+    let m = x & 0x7fffff;
+    if (e <= 0) out[k] = e < -10 ? sign : sign | ((m | 0x800000) >> (14 - e));
+    else if (e >= 31) out[k] = sign | 0x7c00;
+    else {
+      const rest = m & 0x1fff;
+      m >>= 13;
+      let h = sign | (e << 10) | m;
+      if (rest > 0x1000 || (rest === 0x1000 && m & 1)) h += 1;
+      out[k] = h;
+    }
+  }
+  return out;
+}
 
 export function typed(buf, entry) {
   const n = entry.shape.reduce((a, b) => a * b, 1);
@@ -34,56 +72,69 @@ export function typed(buf, entry) {
   return out;
 }
 
+/** An entry's values as float16 bits, whatever it was stored as. */
+function halves(buf, entry) {
+  const n = entry.shape.reduce((a, b) => a * b, 1);
+  return entry.dtype === "float16" ? new Uint16Array(buf, entry.offset, n) : toHalf(new Float32Array(buf, entry.offset, n));
+}
+
 /**
- * Unpacks pixel format 2 (nrp/pixels.py): per channel, a plane of 16-bit values stored as
- * differences from the value to their left, low bytes then high bytes. Returns what format 1
- * stored: aux [NP * C] (the network's features), geom [NP * 4] (position, camera distance; 0 where
- * the pixel sees nothing) and normal [NP * 3] (the aux features' normals).
+ * Undoes nrp/pixels.py's planes (pixel format 2): per channel, 16-bit values stored as differences
+ * from the value to their left, low bytes then high bytes. Writes channel k of pixel p to
+ * out[at(p, k)], yielding to the page every SLICE_MS so a large scene doesn't stall it.
  */
-function unpackPixels(buf, px, W, H, O) {
+async function unpackPlanes(bytes, W, H, channels, at, out) {
   const NP = W * H;
-  const planes = (entry, put) => {
-    const bytes = new Uint8Array(buf, entry.offset, entry.bytes);
-    for (let k = 0; k < entry.channels; k++) {
-      const lo = k * 2 * NP, hi = lo + NP;
-      for (let y = 0; y < H; y++) {
-        let v = 0;
-        for (let p = y * W, end = p + W; p < end; p++) {
-          v = (v + (bytes[lo + p] | (bytes[hi + p] << 8))) & 0xffff;
-          put(p, k, v);
-        }
+  let slice = performance.now();
+  for (let k = 0; k < channels; k++) {
+    const lo = k * 2 * NP, hi = lo + NP;
+    for (let y = 0; y < H; y++) {
+      let v = 0;
+      for (let p = y * W, end = p + W; p < end; p++) {
+        v = (v + (bytes[lo + p] | (bytes[hi + p] << 8))) & 0xffff;
+        out[at(p, k)] = v;
+      }
+      if ((y & 31) === 31 && performance.now() - slice > SLICE_MS) {
+        await yieldTask();
+        slice = performance.now();
       }
     }
-  };
-  const C = px.aux.channels;
-  const aux = new Float32Array(NP * C);
-  planes(px.aux, (p, k, v) => { aux[p * C + k] = f16tab[v]; });
-  const q = new Uint16Array(NP * 3);
-  planes(px.pos, (p, k, v) => { q[p * 3 + k] = v; });
-  const [lo, hi] = px.pos.range, step = (hi - lo) / 65534;
-  const geom = new Float32Array(NP * 4), normal = new Float32Array(NP * 3);
-  for (let p = 0; p < NP; p++) {
-    for (let k = 0; k < 3; k++) normal[p * 3 + k] = aux[p * C + 3 + k];
-    if (!q[p * 3]) continue;
-    let d2 = 0;
-    for (let k = 0; k < 3; k++) {
-      const x = lo + (q[p * 3 + k] - 1) * step;
-      geom[p * 4 + k] = x;
-      d2 += (x - O[k]) ** 2;
-    }
-    geom[p * 4 + 3] = Math.sqrt(d2);
   }
-  return { aux, geom, normal };
+  return out;
+}
+
+/** Format-1 positions ([NP, 4] f32: position, camera distance) as format 2's 16-bit values. */
+function quantisePositions(geom, NP) {
+  let lo = Infinity, hi = -Infinity;
+  for (let p = 0; p < NP; p++) {
+    if (!(geom[p * 4 + 3] > 0)) continue;
+    for (let k = 0; k < 3; k++) { lo = Math.min(lo, geom[p * 4 + k]); hi = Math.max(hi, geom[p * 4 + k]); }
+  }
+  if (!(hi > lo)) { lo = -1; hi = 1; }
+  const pad = (hi - lo) * 1e-4;
+  lo -= pad; hi += pad;
+  const step = (hi - lo) / 65534, pos = new Uint16Array(NP * 4);
+  for (let p = 0; p < NP; p++) {
+    if (!(geom[p * 4 + 3] > 0)) continue;
+    for (let k = 0; k < 3; k++) pos[p * 4 + k] = Math.round((geom[p * 4 + k] - lo) / step) + 1;
+  }
+  return { pos, range: [lo, hi] };
 }
 
 /**
  * Both engines evaluate a light either at every pixel (stride 1) or, as a fast preview, at every
- * s-th pixel in x and y (light.stride = s). A preview is stored compactly (ceil(W/s) x ceil(H/s),
- * row-major) in the light's output slot, and the composite upsamples it along the geometry.
+ * s-th pixel in x and y. A light at stride s is stored compactly (ceil(W/s) x ceil(H/s) items,
+ * row-major) in its output slot, and the composite upsamples it along the geometry. evaluate() can
+ * fill any band of rows and columns of those items, so a light can be refined a band a frame.
+ *
+ * The per-pixel data stays as the 16-bit values it ships as, and the GPU turns it into the
+ * network's inputs and the geometry: aux is the network's per-pixel features as halves, in planes
+ * of 4 channels ([group][pixel][4]); pos is each pixel's surface position as 16-bit values over
+ * pixels.pos.range from 1, 0 where the pixel sees nothing ([pixel][4]).
  */
 export class EngineBase {
   /**
-   * Fetches and unpacks the scene; returns the raw pieces the backend uploads. `res` picks an
+   * Fetches and unpacks the scene; returns the pieces the backend uploads. `res` picks an
    * alternative image size exported with `export.py --res N` (scene-N.json / pixels-N.bin).
    */
   async fetchScene(base, onProgress, res = null) {
@@ -99,7 +150,8 @@ export class EngineBase {
     const scene = await sr.json();
     this.scene = scene;
     onProgress("network weights");
-    const [model, pixels] = await Promise.all([fetchBin("model.bin"), fetchBin(`pixels${suffix}.bin`)]);
+    // A smaller network can share a larger one's pixels (pixels.file), as they don't depend on it.
+    const [model, pixels] = await Promise.all([fetchBin("model.bin"), fetchBin(scene.pixels.file ?? `pixels${suffix}.bin`)]);
     this.refsBuf = null;
     // Reference renders exist only at the resolution the paths were traced at.
     this.refsPromise = scene.refs.length
@@ -108,12 +160,11 @@ export class EngineBase {
 
     const W = scene.width, H = scene.height, NP = W * H;
     this.W = W; this.H = H; this.NP = NP;
-    this.canvas.width = W; this.canvas.height = H;
 
     let gridLen = 0;
     const gridOff = scene.model.grids.map((g) => { const o = gridLen; gridLen += g.shape[0] * g.shape[1] * g.shape[2]; return o; });
-    const grid = new Float32Array(gridLen);
-    scene.model.grids.forEach((g, i) => grid.set(typed(model, g), gridOff[i]));
+    const grid = new Uint16Array(gridLen);
+    scene.model.grids.forEach((g, i) => grid.set(halves(model, g), gridOff[i]));
     const layers = scene.model.layers.map((l) => ({ w: typed(model, l.weight), b: typed(model, l.bias), shape: l.weight.shape }));
     this.paramCount = grid.length + layers.reduce((a, l) => a + l.w.length + l.b.length, 0);
     this.modelBytes = model.byteLength;
@@ -123,48 +174,97 @@ export class EngineBase {
     const tx = Math.tan((scene.camera.fov * Math.PI) / 360);
     this.cam = { X: col(0), Y: col(1), Z: col(2), O: col(3), tx, ty: (tx * H) / W };
 
-    let aux;
+    onProgress("pixel buffers");
+    const auxDim = scene.network.aux_dim ?? 7, AG = Math.ceil(auxDim / 4);
+    const planar = (p, k) => ((k >> 2) * NP + p) * 4 + (k & 3);
+    let aux, pos, range;
     if (scene.pixels.format === 2) {
-      ({ aux, geom: this.geom, normal: this.normal } = unpackPixels(pixels, scene.pixels, W, H, this.cam.O));
+      const px = scene.pixels, plane = (e) => new Uint8Array(pixels, e.offset, e.bytes);
+      aux = await unpackPlanes(plane(px.aux), W, H, px.aux.channels, planar, new Uint16Array(NP * 4 * AG));
+      pos = await unpackPlanes(plane(px.pos), W, H, 3, (p, k) => p * 4 + k, new Uint16Array(NP * 4));
+      range = px.pos.range;
     } else {
-      aux = typed(pixels, scene.pixels.aux);
-      this.geom = typed(pixels, scene.pixels.geom);
-      this.normal = typed(pixels, scene.pixels.normal);
+      // Format 1 (unpacked): the same data in the same form; its normals are the aux features'.
+      const a = halves(pixels, scene.pixels.aux);
+      aux = new Uint16Array(NP * 4 * AG);
+      for (let p = 0; p < NP; p++) for (let k = 0; k < auxDim; k++) aux[planar(p, k)] = a[p * auxDim + k];
+      ({ pos, range } = quantisePositions(typed(pixels, scene.pixels.geom), NP));
     }
+    this.aux = aux; this.pos = pos; this.auxGroups = AG;
+    this.posRange = range;
+    this.posStep = (range[1] - range[0]) / 65534;
     this.lo = scene.light_bbox[0]; this.hi = scene.light_bbox[1];
     [this.rmin, this.rmax] = scene.radius_range;
 
     this.exposure = 1;
     this.mode = 0;
     this.refLight = 0;
-    this.timing = { perLight: 0, byStride: {} };
-    return { scene, grid, gridOff, layers, aux };
+    this.timing = { byStride: {}, samples: 0, pending: null, seeded: false };
+    return { scene, grid, gridOff, layers, aux, pos };
   }
 
-  /** Records the time (ms) of evaluating one light at stride s (every s-th pixel), after warm-up. */
-  recordTiming(s, ms) {
-    this._evals = (this._evals || 0) + 1;
-    if (this._evals > 2) {
-      // Falls quickly and rises slowly: one-off stalls (loading, other tabs) must not make a fast
-      // GPU look slow for long.
-      const t = this.timing.byStride;
-      t[s] = !t[s] ? ms : ms < t[s] ? 0.5 * t[s] + 0.5 * ms : 0.9 * t[s] + 0.1 * ms;
-      this.timing.perLight = t[1] || 0;
-    }
-    this._timing = false;
+  /** The surface pixel p sees: world position, distance from the camera and normal; null where it sees nothing. */
+  surfaceAt(p) {
+    const q = this.pos, o = p * 4;
+    if (!q[o]) return null;
+    const { O } = this.cam;
+    const pos = [0, 1, 2].map((k) => this.posRange[0] + (q[o + k] - 1) * this.posStep);
+    const normal = [3, 4, 5].map((j) => f16tab[this.aux[((j >> 2) * this.NP + p) * 4 + (j & 3)]]);
+    return { pos, dist: Math.hypot(pos[0] - O[0], pos[1] - O[1], pos[2] - O[2]), normal };
+  }
+
+  // ---------------------------------------------------------------- cost model
+  /** Item rows / columns of a light evaluated at stride s. */
+  rows(s = 1) { return Math.ceil(this.H / s); }
+  cols(s = 1) { return Math.ceil(this.W / s); }
+  /** Share of a whole light at stride s that rows [r0, r1) x columns [c0, c1) are. */
+  share(s, r0, r1, c0, c1) { return ((r1 - r0) * (c1 - c0)) / (this.rows(s) * this.cols(s)); }
+  /** Whether an evaluation of that band is worth timing (see MIN_TIMED_SHARE), and no other is being timed. */
+  timeable(s, r0, r1, c0, c1) {
+    const rows = this.rows(s), least = Math.min(1, Math.max(MIN_BAND_ROWS / rows, MIN_TIMED_SHARE));
+    return !this.timing.pending && r1 - r0 >= Math.min(rows, MIN_BAND_ROWS) && this.share(s, r0, r1, c0, c1) >= least;
+  }
+
+  /** Records that evaluating `share` of a light at stride s took ms (null: no reading). */
+  recordTiming(s, share, ms) {
+    const t = this.timing;
+    t.samples++;
+    // The first runs include shader compiles.
+    if (ms === null || !(ms > 0) || t.samples <= 2) return;
+    const full = ms / share;
+    // Costs carried over from an earlier visit or another image size give way to the first reading.
+    if (t.seeded) { t.seeded = false; t.byStride = {}; }
+    const b = t.byStride;
+    // Falls quickly and rises slowly: one-off stalls (loading, other tabs) must not make a fast GPU
+    // look slow for long.
+    b[s] = !b[s] ? full : full < b[s] ? 0.5 * b[s] + 0.5 * full : 0.9 * b[s] + 0.1 * full;
+  }
+
+  /** Starts from costs measured before (ms a whole light, by stride), until this GPU is timed. */
+  seedTiming(byStride) {
+    const t = {};
+    for (const [s, ms] of Object.entries(byStride || {})) if (Number(s) >= 1 && Number.isFinite(ms) && ms > 0) t[s] = ms;
+    if (Object.keys(t).length) { this.timing.byStride = t; this.timing.seeded = true; }
   }
 
   /**
-   * Estimated ms to evaluate one light at stride s, or null before anything was measured. Each
-   * measured stride k predicts t[k] * (k / s)^2; the smallest prediction wins. Scaling up from a
-   * coarser stride also scales its fixed overheads, so those predictions err on the slow side,
-   * and a recent fast measurement at any stride corrects a stale slow one (e.g. taken while the
-   * GPU was still clocked down).
+   * Estimated ms to evaluate one whole light at stride s, or null before anything was measured.
+   * Each measured stride k predicts t[k] * (k / s)^2; the smallest prediction wins. Scaling up from a
+   * coarser stride also scales its fixed overheads, so those predictions err on the slow side, and a
+   * recent fast measurement at any stride corrects a stale slow one (e.g. taken while the GPU was
+   * still clocked down).
    */
   evalCost(s) {
     const t = this.timing.byStride, known = Object.keys(t).map(Number);
     if (!known.length) return null;
     return Math.min(...known.map((k) => t[k] * (k / s) ** 2));
+  }
+
+  /** Runs `fn` (which evaluates) without its timings reaching the cost model. */
+  async untimed(fn) {
+    const saved = this.timing;
+    this.timing = { ...saved, pending: {} };
+    try { return await fn(); } finally { this.timing = saved; }
   }
 
   async referenceData(i) {
@@ -174,6 +274,16 @@ export class EngineBase {
     const r4 = new Float32Array(this.NP * 4);
     for (let p = 0; p < this.NP; p++) { r4[p * 4] = img[p * 3]; r4[p * 4 + 1] = img[p * 3 + 1]; r4[p * 4 + 2] = img[p * 3 + 2]; }
     return r4;
+  }
+
+  /** Evaluates the dirty lights (each at its stride) and composites. */
+  render(lights) {
+    for (const l of lights) {
+      if (!l.dirty) continue;
+      this.evaluate(l, l.slot, l.stride || 1);
+      l.dirty = false;
+    }
+    this.composite(lights);
   }
 
   normLight(l) {
@@ -218,8 +328,7 @@ export class EngineBase {
     const Ln = Math.hypot(v[0], v[1], v[2]);
     if (Ln <= r * 1.001) return zero;
     const u = v.map((x) => x / Ln);
-    const gw = this.geom[p * 4 + 3];
-    const surf = gw > 0 ? gw : 1e9;
+    const surf = this.surfaceAt(p)?.dist ?? 1e9;
     if (Ln - r > surf || u[0] * Z[0] + u[1] * Z[1] + u[2] * Z[2] <= 0) return zero;
     const ct = Math.min(1, Math.max(-1, d[0] * u[0] + d[1] * u[1] + d[2] * u[2]));
     const th = Math.acos(ct), sa = r / Ln, al = Math.asin(sa);

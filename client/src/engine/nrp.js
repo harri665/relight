@@ -1,8 +1,8 @@
 // WebGPU runtime for a neural render proxy exported by nrp/export.py.
 import { makeShaders } from "./shaders.js";
-import { EngineBase, MAX_LIGHTS, chooseKernel, rememberKernel } from "./engine-base.js";
+import { EngineBase, MAX_LIGHTS, SLOTS, SPARE, chooseKernel, rememberKernel, toHalf } from "./engine-base.js";
 
-export { MAX_LIGHTS };
+export { MAX_LIGHTS, SLOTS, SPARE };
 export { GLEngine } from "./nrp-gl.js";
 
 // Shapes of the display kernel (shaders.js fastForward): threads in a workgroup, and pixels each
@@ -15,39 +15,22 @@ export const KERNELS = [
 ];
 export const kernelKey = (k) => `${k.threads}x${k.pixels}`;
 
-// float32 -> float16 bits, rounded to nearest even
-function toHalf(values) {
-  const out = new Uint16Array(values.length);
-  const f = new Float32Array(1), bits = new Uint32Array(f.buffer);
-  for (let k = 0; k < values.length; k++) {
-    f[0] = values[k];
-    const x = bits[0], sign = (x >>> 16) & 0x8000, e = ((x >>> 23) & 0xff) - 112;
-    let m = x & 0x7fffff;
-    if (e <= 0) out[k] = e < -10 ? sign : sign | ((m | 0x800000) >> (14 - e));
-    else if (e >= 31) out[k] = sign | 0x7c00;
-    else {
-      const rest = m & 0x1fff;
-      m >>= 13;
-      let h = sign | (e << 10) | m;
-      if (rest > 0x1000 || (rest === 0x1000 && m & 1)) h += 1;
-      out[k] = h;
-    }
-  }
-  return out;
-}
+// ms: queue completions closer than this get reported together
+const QUEUE_GRAIN = 0.1;
 
 const sigmoid = (x) => 1 / (1 + Math.exp(-x));
 
 export class NRPEngine extends EngineBase {
   static async create(canvas) {
-    if (!navigator.gpu) throw new Error("WebGPU is not available in this browser.");
+    if (!navigator.gpu) throw new Error(window.isSecureContext ? "this browser has no WebGPU" : "WebGPU needs HTTPS (or localhost)");
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
-    if (!adapter) throw new Error("No WebGPU adapter found.");
+    if (!adapter) throw new Error("the browser offers no WebGPU adapter for this GPU");
     const L = adapter.limits;
     if (L.maxComputeWorkgroupStorageSize < 24576) throw new Error("GPU lacks 24 KB workgroup memory.");
-    // 16-bit arithmetic where the GPU has it: about a third faster on an RTX 3080
+    // 16-bit arithmetic where the GPU has it (about a third faster on an RTX 3080), and timestamps
+    // to time the network on the GPU itself
     const device = await adapter.requestDevice({
-      requiredFeatures: adapter.features.has("shader-f16") ? ["shader-f16"] : [],
+      requiredFeatures: ["shader-f16", "timestamp-query"].filter((f) => adapter.features.has(f)),
       requiredLimits: {
         maxStorageBufferBindingSize: L.maxStorageBufferBindingSize,
         maxBufferSize: L.maxBufferSize,
@@ -63,13 +46,18 @@ export class NRPEngine extends EngineBase {
     e.ctx = canvas.getContext("webgpu");
     e.format = navigator.gpu.getPreferredCanvasFormat();
     e.ctx.configure({ device, format: e.format, alphaMode: "opaque" });
-    device.lost.then((info) => console.error("WebGPU device lost:", info.message));
+    // A lost device (GPU reset, driver update) is reported to the runtime, which falls back to WebGL.
+    device.lost.then((info) => {
+      if (info.reason === "destroyed") return;
+      console.error("WebGPU device lost:", info.message);
+      e.onLost?.(info);
+    });
     return e;
   }
 
   async load(base, onProgress = () => {}, res = null) {
     const dev = this.device;
-    const { scene, grid, gridOff, layers, aux } = await this.fetchScene(base, onProgress, res);
+    const { scene, grid, gridOff, layers, aux, pos } = await this.fetchScene(base, onProgress, res);
     const { W, H, NP } = this;
     const net = scene.network;
     const WD = net.width, NH = net.hidden - 1;
@@ -103,19 +91,9 @@ export class NRPEngine extends EngineBase {
     }
     P.set(layers[NH + 1].w, off.WO); P.set(layers[NH + 1].b, off.BO);
 
-    // --- per-pixel buffers
-    const AUXS = Math.ceil(auxDim / 4) * 4;
-    const auxB = new Float32Array(NP * AUXS);
-    for (let p = 0; p < NP; p++) for (let j = 0; j < auxDim; j++) auxB[p * AUXS + j] = aux[p * auxDim + j];
-    const pgeo = new Float32Array(NP * 8);   // (position, camera distance), (normal, 0)
-    for (let p = 0; p < NP; p++) {
-      for (let k = 0; k < 4; k++) pgeo[p * 8 + k] = this.geom[p * 4 + k];
-      for (let k = 0; k < 3; k++) pgeo[p * 8 + 4 + k] = this.normal[p * 3 + k];
-    }
-
     onProgress("compiling kernels");
     const S = makeShaders({ WD, NH, W, H, levels: net.grid_res.length, feats: net.feats, gridRes: net.grid_res,
-      gridOff, off, auxDim, geo, mul, IN });
+      gridOff, off, auxDim, geo, mul, IN, posRange: this.posRange, camO: this.cam.O });
     this.S = S;
     const half = dev.features.has("shader-f16");
     this.half = half;
@@ -127,6 +105,7 @@ export class NRPEngine extends EngineBase {
       return k.threads % S.CG === 0 && k.threads <= lim.maxComputeInvocationsPerWorkgroup &&
         bytes <= lim.maxComputeWorkgroupStorageSize && Math.ceil(NP / tile) <= lim.maxComputeWorkgroupsPerDimension;
     });
+    if (!this.kernels.length) throw new Error("not enough workgroup memory for the display kernel");
     const mod = (code, label) => dev.createShaderModule({ code, label });
     const cp = (code, label) => dev.createComputePipelineAsync({ layout: "auto", compute: { module: mod(code, label), entryPoint: "main" }, label });
     const [pPre, pFwd, pComp, pLoss, pGrad] = await Promise.all([
@@ -143,24 +122,30 @@ export class NRPEngine extends EngineBase {
 
     // --- GPU buffers
     const SU = GPUBufferUsage;
+    this.buffers = [];
     const buf = (size, usage, data) => {
       const b = dev.createBuffer({ size: Math.max(16, Math.ceil(size / 16) * 16), usage, mappedAtCreation: !!data });
       if (data) { new data.constructor(b.getMappedRange()).set(data); b.unmap(); }
+      this.buffers.push(b);
       return b;
     };
     const ST = SU.STORAGE | SU.COPY_DST | SU.COPY_SRC;
     this.wBuf = buf(P.byteLength, ST, P);
-    const gridBuf = buf(grid.byteLength, ST, grid);
-    const auxBuf = buf(auxB.byteLength, ST, auxB);
-    this.pgeoBuf = buf(pgeo.byteLength, ST, pgeo);
     this.xBuf = buf(NP * S.XW * 4, ST);   // pixel inputs as f16 pairs (was a WD-float first-layer cache per pixel)
-    this.outBuf = buf(MAX_LIGHTS * NP * 16 * S.OUTV, ST);   // display outputs: rgb, or a and b of a * G + b
+    this.pgeoBuf = buf(NP * 32, ST);
+    this.outBuf = buf(SLOTS * NP * S.NW * 4, ST);   // display outputs as halves: rgb, or a and b of a * G + b
     this.refBuf = buf(NP * 16, ST);
     this.dispBuf = buf(NP * 4, ST);
     this.hdrBuf = buf(NP * 16, ST);
     this.frameBuf = buf(96 + MAX_LIGHTS * 48, SU.UNIFORM | SU.COPY_DST);
     this.jobsBuf = buf(MAX_LIGHTS * S.JOB * 16, ST);
-    this.fwdU = buf(16, SU.UNIFORM | SU.COPY_DST, new Uint32Array([NP, 0, 1, NP]));
+    this.bandU = buf(32, SU.UNIFORM | SU.COPY_DST);
+    this.bandWords = new Uint32Array(8);
+    if (dev.features.has("timestamp-query")) {
+      this.querySet = dev.createQuerySet({ type: "timestamp", count: 2 });
+      this.queryBuf = buf(16, SU.QUERY_RESOLVE | SU.COPY_SRC);
+      this.stampBuf = buf(16, SU.MAP_READ | SU.COPY_DST);
+    }
 
     // optimisation buffers
     this.K = 4096;
@@ -182,7 +167,6 @@ export class NRPEngine extends EngineBase {
       layout: pipe.getBindGroupLayout(group),
       entries: bufs.map((b, i) => ({ binding: i, resource: { buffer: b } })),
     });
-    this.bgFwd = bg(pFwd, 0, [this.wBuf, this.xBuf, this.jobsBuf, this.fwdU, this.subIdxBuf, this.pgeoBuf, this.outBuf]);
     this.bgFwdSub = bg(pFwd, 0, [this.wBuf, this.xBuf, this.jobsSubBuf, this.fwdSubU, this.subIdxBuf, this.pgeoBuf, this.subOutBuf]);
     this.bgComp = bg(pComp, 0, [this.frameBuf, this.outBuf, this.pgeoBuf, this.refBuf, this.dispBuf, this.hdrBuf]);
     this.bgBlit = bg(pBlit, 0, [this.dispBuf]);
@@ -190,17 +174,23 @@ export class NRPEngine extends EngineBase {
     this.bgGrad0 = bg(pGrad, 0, [this.wBuf, this.xBuf, this.jobsSubBuf, this.fwdSubU, this.subIdxBuf, this.pgeoBuf]);
     this.bgGrad1 = bg(pGrad, 1, [this.frameBuf, this.optU, this.dLdIBuf, this.subOutBuf, this.subDirBuf, this.scrBuf, this.partBuf]);
 
-    // --- precompute each pixel's network inputs
+    // --- each pixel's network inputs and geometry, built on the GPU from the 16-bit data
     onProgress("precomputing pixel features");
-    const bgPre = bg(pPre, 0, [gridBuf, auxBuf, this.xBuf]);
+    const upload = (data) => {
+      const b = dev.createBuffer({ size: Math.max(16, Math.ceil(data.byteLength / 16) * 16), usage: SU.STORAGE, mappedAtCreation: true });
+      new Uint16Array(b.getMappedRange()).set(data);
+      b.unmap();
+      return b;
+    };
+    const inputs = [upload(grid), upload(aux), upload(pos)];
     const enc = dev.createCommandEncoder();
     const pass = enc.beginComputePass();
-    pass.setPipeline(pPre); pass.setBindGroup(0, bgPre);
+    pass.setPipeline(pPre); pass.setBindGroup(0, bg(pPre, 0, [...inputs, this.xBuf, this.pgeoBuf]));
     pass.dispatchWorkgroups(Math.ceil(NP / 64));
     pass.end();
     dev.queue.submit([enc.finish()]);
     await dev.queue.onSubmittedWorkDone();
-    gridBuf.destroy(); auxBuf.destroy();
+    inputs.forEach((b) => b.destroy());
 
     // --- the display kernel: f16 weights beside the f32 ones the gradient path reads
     this.wBufH = half ? buf(P.length * 2, ST, toHalf(P)) : this.wBuf;
@@ -209,9 +199,9 @@ export class NRPEngine extends EngineBase {
     this.kernelStore = `relight-kernel:webgpu:${ai.vendor}/${ai.architecture}/${ai.description}:${W}x${H}:${WD}x${NH}:${half ? 16 : 32}`;
     const { name, forced } = chooseKernel(this.kernelStore);
     const known = this.kernels.find((k) => kernelKey(k) === name);
-    if (!this.kernels.length) throw new Error("not enough workgroup memory for the display kernel");
     await this.setKernel(known || this.kernels[0]);
-    if (!known && !forced && this.kernels.length > 1) {
+    this.tuned = !!known || forced || this.kernels.length < 2;
+    if (!this.tuned) {
       onProgress("timing kernel shapes");
       await this.tune();
       rememberKernel(this.kernelStore, kernelKey(this.kernel));
@@ -220,8 +210,17 @@ export class NRPEngine extends EngineBase {
     return scene;
   }
 
+  dispose() {
+    this.querySet?.destroy();
+    this.buffers?.forEach((b) => b.destroy());
+    this.buffers = [];
+    this.ctx?.unconfigure();
+    this.device.destroy();
+  }
+
   // ------------------------------------------------------------------ display kernel
-  get kernelName() { return kernelKey(this.kernel) + (this.half ? " f16" : " f32"); }
+  get kernelName() { return kernelKey(this.kernel); }
+  get precision() { return this.half ? "16-bit floats (shader-f16)" : "32-bit floats"; }
 
   async kernelPipeline(k) {
     const code = this.S.fastForward({ ...k, half: this.half });
@@ -234,44 +233,101 @@ export class NRPEngine extends EngineBase {
     this.kernel = k;
     this.pFast = pipeline;
     // subIdx (binding 4) is not read by the display kernel, so it is not in its layout
-    const list = [[0, this.wBufH], [1, this.xBuf], [2, this.jobsBuf], [3, this.fwdU], [5, this.pgeoBuf], [6, this.outBuf]];
+    const list = [[0, this.wBufH], [1, this.xBuf], [2, this.jobsBuf], [3, this.bandU], [5, this.pgeoBuf], [6, this.outBuf]];
     this.bgFast = this.device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0), entries: list.map(([binding, b]) => ({ binding, resource: { buffer: b } })) });
     this.tile = (k.threads / this.S.CG) * k.pixels;
   }
 
-  /** Times each kernel shape that fits on a light in the middle of the box, and keeps the fastest. */
-  async tune(runs = 3) {
-    const light = { pos: [0, 1, 2].map((i) => (this.lo[i] + this.hi[i]) / 2), radius: (this.rmin + this.rmax) / 2,
-      color: [1, 1, 1], intensity: 1, slot: 0 };
+  /**
+   * Times each kernel shape that fits on a light in the middle of the box (in the spare slot, at
+   * `stride`), and keeps the fastest.
+   */
+  async tune(stride = 1, runs = 3) {
+    const light = { pos: [0, 1, 2].map((i) => (this.lo[i] + this.hi[i]) / 2), radius: (this.rmin + this.rmax) / 2 };
+    const done = () => this.device.queue.onSubmittedWorkDone();
     const times = {};
     let best = null;
-    for (const k of this.kernels) {
-      await this.setKernel(k);
-      this.evalLights([light], 1);          // the first run of a pipeline sets it up
-      await this.device.queue.onSubmittedWorkDone();
-      const t0 = performance.now();
-      for (let i = 0; i < runs; i++) this.evalLights([light], 1);
-      await this.device.queue.onSubmittedWorkDone();
-      const ms = (performance.now() - t0) / runs;
-      times[kernelKey(k)] = ms;
-      if (!best || ms < best.ms) best = { k, ms };
-    }
+    await this.untimed(async () => {
+      for (const k of this.kernels) {
+        await this.setKernel(k);
+        this.evaluate(light, SPARE, stride);          // the first run of a pipeline sets it up
+        await done();
+        const t0 = performance.now();
+        for (let i = 0; i < runs; i++) this.evaluate(light, SPARE, stride);
+        await done();
+        const ms = (performance.now() - t0) / runs;
+        times[kernelKey(k)] = ms;
+        if (!best || ms < best.ms) best = { k, ms };
+      }
+    });
     await this.setKernel(best.k);
     this.kernelTimes = times;
+    this.tuned = true;
     console.info("kernel shapes (ms per light):", times, "->", kernelKey(best.k));
   }
 
-  /** One dispatch evaluating lights at stride s with the display kernel. */
-  evalLights(ls, s) {
-    const n = Math.ceil(this.W / s) * Math.ceil(this.H / s);
-    this.device.queue.writeBuffer(this.fwdU, 0, new Uint32Array([n, 0, s, this.NP]));
-    this.writeJobs(this.jobsBuf, ls.map((l) => [l, l.slot]));
-    const enc = this.device.createCommandEncoder(), pass = enc.beginComputePass();
+  /**
+   * Evaluates light l into output slot `slot` at stride s: the item rows [r0, r1) and columns
+   * [c0, c1) of its ceil(W/s) x ceil(H/s) grid (by default all of them). Large enough evaluations
+   * are timed on the GPU (see pollTiming).
+   */
+  evaluate(l, slot, s = 1, r0 = 0, r1 = this.rows(s), c0 = 0, c1 = this.cols(s)) {
+    const dev = this.device;
+    r1 = Math.min(r1, this.rows(s)); c1 = Math.min(c1, this.cols(s));
+    const xw = c1 - c0, i0 = r0 * xw, i1 = r1 * xw;
+    if (i1 <= i0 || xw <= 0) return;
+    this.bandWords.set([i0, i1, s, c0, xw]);
+    dev.queue.writeBuffer(this.bandU, 0, this.bandWords);
+    this.writeJobs(this.jobsBuf, [[l, slot]]);
+    const timed = this.timeable(s, r0, r1, c0, c1);
+    const stamped = timed && this.querySet && this.stampBuf.mapState === "unmapped";
+    const enc = dev.createCommandEncoder();
+    const pass = enc.beginComputePass(stamped
+      ? { timestampWrites: { querySet: this.querySet, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 } }
+      : undefined);
     pass.setPipeline(this.pFast); pass.setBindGroup(0, this.bgFast);
-    pass.dispatchWorkgroups(Math.ceil(n / this.tile), ls.length);
+    pass.dispatchWorkgroups(Math.ceil((i1 - i0) / this.tile));
     pass.end();
-    this.device.queue.submit([enc.finish()]);
+    if (stamped) {
+      enc.resolveQuerySet(this.querySet, 0, 2, this.queryBuf, 0);
+      enc.copyBufferToBuffer(this.queryBuf, 0, this.stampBuf, 0, 16);
+    }
+    // Without timestamps: from when the work queued before this finished to when this did
+    const queued = timed && !stamped ? this.queueDone() : null;
+    dev.queue.submit([enc.finish()]);
+    if (timed) this.time(s, this.share(s, r0, r1, c0, c1), stamped, queued);
+  }
+
+  queueDone() { return this.device.queue.onSubmittedWorkDone().then(() => performance.now()); }
+
+  // Many phones have no timestamp queries. Timing from submit counted the rest of the frame and
+  // made the network look several times slower than it is.
+  time(s, share, stamped, queued) {
+    const pending = { stride: s, share, done: false, ms: null };
+    this.timing.pending = pending;
+    const start = performance.now();
+    const settle = (ms) => { pending.ms = ms > 0 ? ms : null; pending.done = true; };
+    if (stamped) {
+      this.stampBuf.mapAsync(GPUMapMode.READ).then(() => {
+        const t = new BigUint64Array(this.stampBuf.getMappedRange());
+        const ms = Number(t[1] - t[0]) / 1e6;
+        this.stampBuf.unmap();
+        settle(ms);
+      }).catch(() => settle(null));
+    } else {
+      // Chrome sometimes resolves both at once behind a long queue; then time since submit.
+      Promise.all([queued, this.queueDone()]).then(([before, after]) => {
+        const ms = after - Math.max(start, before);
+        settle(ms > QUEUE_GRAIN ? ms : after - start);
+      }).catch(() => settle(null));
+    }
+  }
+
+  /** Records the evaluation being timed once its reading is in; call once a frame. */
+  pollTiming() {
+    const p = this.timing.pending;
+    if (p?.done) { this.timing.pending = null; this.recordTiming(p.stride, p.share, p.ms); }
   }
 
   // ------------------------------------------------------------------ helpers
@@ -293,7 +349,7 @@ export class NRPEngine extends EngineBase {
   /** Job j: [0] center, radius  [1].x slot  [2..] add = W0[:, light] . normalised light params. */
   writeJobs(buffer, entries) {
     const JOB = this.S.JOB, WD = this.WD;
-    const F = new Float32Array(MAX_LIGHTS * JOB * 4);
+    const F = new Float32Array(entries.length * JOB * 4);
     entries.forEach(([l, slot], j) => {
       const o = j * JOB * 4;
       F.set([...l.pos, l.radius], o);
@@ -308,38 +364,35 @@ export class NRPEngine extends EngineBase {
   }
 
   // ------------------------------------------------------------------ render
-  /** lights: [{pos, radius, color, intensity, enabled, slot, dirty, stride?}] */
-  render(lights) {
+  /**
+   * Puts the lights' slots together into the image and shows it.
+   * lights: [{pos, radius, color, intensity, enabled, slot, stride?}], pos and radius as evaluated.
+   */
+  composite(lights) {
     const dev = this.device;
     this.writeFrame(lights);
-    const dirty = lights.filter((l) => l.dirty);
-    // Dirty lights, one dispatch per evaluation stride (see EngineBase).
-    const groups = new Map();
-    for (const l of dirty) {
-      const s = l.stride || 1;
-      groups.set(s, [...(groups.get(s) || []), l]);
-      l.dirty = false;
-    }
-    const t0 = performance.now();
-    for (const [s, ls] of groups) {
-      this.evalLights(ls, s);
-    }
-    if (groups.size === 1 && !this._timing) {
-      this._timing = true;
-      const [s] = groups.keys();
-      dev.queue.onSubmittedWorkDone().then(() => this.recordTiming(s, (performance.now() - t0) / dirty.length));
-    }
     const enc = dev.createCommandEncoder();
     const pass = enc.beginComputePass();
     pass.setPipeline(this.pComp); pass.setBindGroup(0, this.bgComp);
     pass.dispatchWorkgroups(Math.ceil(this.NP / 64));
     pass.end();
+    dev.queue.submit([enc.finish()]);
+    this.present();
+  }
+
+  /** Draws the last composited image to the canvas. */
+  present() {
+    const dev = this.device;
+    const enc = dev.createCommandEncoder();
     const rp = enc.beginRenderPass({
       colorAttachments: [{ view: this.ctx.getCurrentTexture().createView(), loadOp: "clear", storeOp: "store", clearValue: [0, 0, 0, 1] }],
     });
     rp.setPipeline(this.pBlit); rp.setBindGroup(0, this.bgBlit); rp.draw(3); rp.end();
     dev.queue.submit([enc.finish()]);
   }
+
+  /** Resolves once the GPU has finished the work submitted so far. */
+  finish() { return this.device.queue.onSubmittedWorkDone(); }
 
   async readBuffer(src, size) {
     const dev = this.device;
