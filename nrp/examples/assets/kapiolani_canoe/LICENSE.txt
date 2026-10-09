@@ -1,0 +1,22 @@
+Queen Kapi'olani's Wa'a (Outrigger Canoe)
+
+Object:   Outrigger canoe (wa'a), Hawai'i. Given to the Smithsonian by Queen Kapi'olani of the
+          Kingdom of Hawai'i in 1887. National Museum of Natural History, Department of
+          Anthropology, Smithsonian Institution (EDAN record edanmdm:nmnhanthropology_8344757).
+3D scan:  Captured and modelled by the University of South Florida Center for Digital Heritage
+          and Geospatial Information, for the Smithsonian.
+Source:   https://3d.si.edu/object/3d/e6b9bb11-8297-4883-9b6f-101233999337
+          https://www.si.edu/object/3d/queen-kapiolanis-waa-outrigger-canoe:e6b9bb11-8297-4883-9b6f-101233999337
+Files:    https://3d-api.si.edu/content/document/3d_package:e6b9bb11-8297-4883-9b6f-101233999337/
+          canoe-{body-35k,moos-15k,paletos-15k,ropes-15k,sail-20k}-ar.glb
+License:  CC0 1.0 Universal (Public Domain Dedication), as released through Smithsonian Open
+          Access ("CC0 Usage Conditions Apply").
+          https://creativecommons.org/publicdomain/zero/1.0/
+          https://www.si.edu/openaccess
+
+Changes:  converted to USD by convert.py (in this folder): millimetres to centimetres, the five
+          parts as five meshes, textures downscaled to 1024 px and the occlusion maps dropped.
+
+No attribution is required under CC0, but please credit the Smithsonian Institution and the
+University of South Florida CDHGI where practical. The wa'a is a cultural treasure of the
+Hawaiian people; use it respectfully.
