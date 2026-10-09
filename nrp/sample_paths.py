@@ -37,7 +37,13 @@ def to_np(v):
     return a if a.shape[0] == 3 else a.T
 
 
-def trace_chunk(scene, sensor, res, k, seed, max_seg):
+def trace_chunk(scene, sensor, res, k, seed, max_seg, medium=None):
+    """Light-agnostic camera paths. With a `medium` (config["medium"]: homogeneous, placed by the
+    shapes' interior/exterior media, see usd_scene.py), paths in it sample free flights with the
+    grey coefficient mean(sigma_t): a flight shorter than the next surface ends in a scattering
+    event (Henyey-Greenstein), and throughputs carry the per-channel correction. Segments that run
+    through the medium are stored with negated throughput; the gather takes the magnitude and
+    applies exp(-(sigma_t - mean) * distance) to where the light is hit (gather.py)."""
     W, H = res
     n = W * H * k
     sampler = mi.load_dict({"type": "independent"})
@@ -52,19 +58,56 @@ def trace_chunk(scene, sensor, res, k, seed, max_seg):
     T = dr.full(mi.Color3f, 1.0, n)
     active = dr.full(mi.Bool, True, n)
     prev = mi.Point3f(ray.o)
+    if medium:
+        sigma_t = mi.Color3f(*medium["sigma_t"])
+        albedo = mi.Color3f(*medium["albedo"])
+        s_bar, g = float(np.mean(medium["sigma_t"])), float(medium["g"])
+        wet = dr.full(mi.Bool, medium.get("camera") == "water", n)
     verts, thr = [to_np(prev)], []
     for _ in range(max_seg):
         si = scene.ray_intersect(ray, active)
         # Hits beyond FAR count as escapes: light from there is negligible for lights near the
         # scene, and it keeps vertices within fp16 range for stages with huge ground planes.
         hit = active & si.is_valid() & (si.t < FAR)
-        end = dr.select(hit, si.p, dr.select(active, ray.o + ray.d * FAR, prev))
         seg_T = dr.select(active, T, 0.0)
-        bsdf = si.bsdf(ray)
-        bs, w = bsdf.sample(ctx, si, sampler.next_1d(hit), sampler.next_2d(hit), hit)
-        T = dr.select(hit, T * w, 0.0)
-        active = hit & ((T[0] > 0) | (T[1] > 0) | (T[2] > 0))
-        ray = si.spawn_ray(si.to_world(bs.wo))
+        if not medium:
+            end = dr.select(hit, si.p, dr.select(active, ray.o + ray.d * FAR, prev))
+            bsdf = si.bsdf(ray)
+            bs, w = bsdf.sample(ctx, si, sampler.next_1d(hit), sampler.next_2d(hit), hit)
+            T = dr.select(hit, T * w, 0.0)
+            active = hit & ((T[0] > 0) | (T[1] > 0) | (T[2] > 0))
+            ray = si.spawn_ray(si.to_world(bs.wo))
+        else:
+            in_med = active & wet
+            t_surf = dr.select(hit, si.t, FAR)
+            t_free = -dr.log(1 - sampler.next_1d(in_med)) / s_bar
+            scat = in_med & (t_free < t_surf)
+            t_end = dr.select(scat, t_free, t_surf)
+            # Throughput relative to grey free-flight sampling, and the albedo at a scattering event.
+            T = dr.select(in_med, T * dr.exp(-(sigma_t - s_bar) * t_end), T)
+            seg_T = dr.select(in_med, -seg_T, seg_T)
+            surf = hit & ~scat
+            end = dr.select(scat, ray.o + ray.d * t_free,
+                            dr.select(hit, si.p, dr.select(active, ray.o + ray.d * FAR, prev)))
+            bsdf = si.bsdf(ray)
+            bs, w = bsdf.sample(ctx, si, sampler.next_1d(surf), sampler.next_2d(surf), surf)
+            wo_surf = si.to_world(bs.wo)
+            # Henyey-Greenstein direction about the direction of travel.
+            u1, u2 = sampler.next_1d(scat), sampler.next_1d(scat)
+            if abs(g) < 1e-3:
+                cos_t = 1 - 2 * u1
+            else:
+                sq = (1 - g * g) / (1 - g + 2 * g * u1)
+                cos_t = (1 + g * g - sq * sq) / (2 * g)
+            sin_t = dr.safe_sqrt(1 - cos_t * cos_t)
+            phi = 2 * dr.pi * u2
+            wo_med = mi.Frame3f(ray.d).to_world(mi.Vector3f(sin_t * dr.cos(phi), sin_t * dr.sin(phi), cos_t))
+            T = dr.select(surf, T * w, dr.select(scat, T * albedo * sigma_t / s_bar, 0.0))
+            active = (surf | scat) & ((T[0] > 0) | (T[1] > 0) | (T[2] > 0))
+            spawned = si.spawn_ray(wo_surf)
+            ray = mi.Ray3f(dr.select(surf, spawned.o, end), dr.select(surf, spawned.d, wo_med))
+            wet = dr.select(surf, si.target_medium(wo_surf) != None, wet)  # noqa: E711
+            dr.eval(wet)
         prev = end
         sampler.schedule_state()
         dr.eval(T, active, ray, prev, seg_T)
@@ -156,9 +199,9 @@ def main():
     thr = np.lib.format.open_memmap(out / "thr.npy", "w+", np.float16, (D, 3, P, S))
     for s0 in range(0, S, args.chunk):
         k = min(args.chunk, S - s0)
-        v, t = trace_chunk(scene, sensor, (W, H), k, seed=1000 + s0, max_seg=D)
+        v, t = trace_chunk(scene, sensor, (W, H), k, seed=1000 + s0, max_seg=D, medium=cfg.get("medium"))
         verts[..., s0:s0 + k] = v.reshape(D + 1, 3, P, k)
-        thr[..., s0:s0 + k] = np.minimum(t, 6e4).reshape(D, 3, P, k)
+        thr[..., s0:s0 + k] = np.clip(t, -6e4, 6e4).reshape(D, 3, P, k)
         print(f"  traced spp {s0 + k}/{S}  ({time.time() - t0:.1f}s)", flush=True)
     verts.flush(); thr.flush()
     del verts, thr
@@ -177,7 +220,7 @@ def main():
         },
         "light_bbox": cfg["light_bbox"],
         "radius_range": cfg["radius_range"],
-        **{k: cfg[k] for k in ("source", "normalize", "test_lights", "default_lights") if k in cfg},
+        **{k: cfg[k] for k in ("source", "normalize", "test_lights", "default_lights", "medium") if k in cfg},
     }
     (out / "meta.json").write_text(json.dumps(meta, indent=1))
     print(f"done in {time.time() - t0:.1f}s -> {out}")

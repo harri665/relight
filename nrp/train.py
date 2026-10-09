@@ -4,6 +4,12 @@ For each batch every sample picks a random pixel and a random image from a pool
 of denoised GATHERLIGHT reconstructions, each rendered with its own random light.
 A background thread keeps producing fresh pool images (gather on GPU, denoise on
 CPU); the main loop swaps them in (default: 2 images every 5 iterations).
+
+With --refresh N, one slice of --refresh-spp samples per pixel of the path dump is re-traced with
+new seeds every N iterations. Together with --no-denoise, the network then learns from raw
+targets whose noise keeps changing, and converges to the noise-free image (as in Noise2Noise)
+instead of a denoiser's blurred version of 128 fixed samples, which matters for caustics and
+small lights. It needs the scene itself (sample_paths.py's tracer) in the training process.
 """
 import argparse
 import json
@@ -30,7 +36,10 @@ def tonemap(x):
 
 
 def psnr_tm(pred, ref):
-    return (-10 * torch.log10(((tonemap(pred) - tonemap(ref)) ** 2).mean())).item()
+    """PSNR after Reinhard tonemapping, both exposed so the reference's mean luminance is 0.15
+    (as evaluate.py and the viewer's Accuracy tab do; unnormalised, dim scenes score absurdly high)."""
+    k = 0.15 / (ref * torch.tensor([0.2126, 0.7152, 0.0722], device=ref.device)).sum(-1).mean().clamp_min(1e-12)
+    return (-10 * torch.log10(((tonemap(pred * k) - tonemap(ref * k)) ** 2).mean())).item()
 
 
 class LightSampler:
@@ -134,6 +143,15 @@ def main():
     ap.add_argument("--rel-eps", type=float, default=0.01,
                     help="relative MSE: (pred - target)^2 / (pred^2 + rel_eps). Targets are transport per unit "
                          "radiance (median ~1e-3), so 0.01 makes this plain MSE for nearly every pixel")
+    ap.add_argument("--refresh", type=int, default=0,
+                    help="re-trace a slice of the path dump every N iterations (see above); 0 = never")
+    ap.add_argument("--refresh-spp", type=int, default=16, help="samples per pixel re-traced per refresh")
+    ap.add_argument("--eps-scale", type=float, default=0.0,
+                    help="relative MSE floor as a fraction of each training image's mean (0 = the fixed --rel-eps, "
+                         "tuned for the Cornell box's brightness; dimmer scenes need e.g. 0.1)")
+    ap.add_argument("--checkpoint-every", type=int, default=5000,
+                    help="save model and optimiser state every N iterations (0 = only at the end)")
+    ap.add_argument("--resume", action="store_true", help="continue from the run's checkpoint, if there is one")
     ap.add_argument("--first-seg", type=int, default=1,
                     help="1: network skips segment 0 (direct view, added analytically); 0: paper setup")
     args = ap.parse_args()
@@ -159,6 +177,26 @@ def main():
     cell_cnt = torch.zeros(G3, device="cuda")
     producer = Producer(pd, sampler, denoiser, args.first_seg, batch=args.replace)
 
+    refresh = None
+    if args.refresh:
+        import sample_paths  # sets the Mitsuba variant
+        import scenes
+        scene = scenes.load(args.scene, W)[0]
+        sensor, spp_r = scene.sensors()[0], args.refresh_spp
+        assert pd.S % spp_r == 0, "--refresh-spp must divide the dump's spp"
+        n_done = [0]
+
+        def refresh():
+            slot = n_done[0] % (pd.S // spp_r)
+            v, t = sample_paths.trace_chunk(scene, sensor, (pd.W, pd.H), spp_r, seed=50_000_000 + n_done[0] * spp_r,
+                                            max_seg=pd.D, medium=meta.get("medium"))
+            pd.replace_samples(slot * spp_r, torch.from_numpy(v).cuda().half(),
+                               torch.from_numpy(np.clip(t, -6e4, 6e4)).cuda().half())
+            n_done[0] += 1
+            # Hand the tracer's cached GPU memory back: sharing the card with PyTorch's allocator,
+            # it otherwise pushes training into constant reallocation (3-4x slower).
+            sample_paths.dr.flush_malloc_cache()
+
     # Validation set: fixed lights. References are full images (all segments):
     # "denoised" = denoised network target + analytic direct term, "raw" = plain gather.
     val_lights = LightSampler(pd, meta, seed=12345)(16)
@@ -172,10 +210,15 @@ def main():
     t0 = time.time()
     pool = torch.empty(args.pool, NP, 3, dtype=torch.float16, device="cuda")
     pool_lights = torch.empty(args.pool, 4, device="cuda")
-    for i in range(0, args.pool, 10):
-        l, im = producer.make(min(10, args.pool - i))
-        pool[i:i + len(l)] = im.reshape(len(l), NP, 3)
-        pool_lights[i:i + len(l)] = l
+    pool_mean = torch.empty(args.pool, device="cuda")  # per image, for --eps-scale
+    filled = 0
+    while filled < args.pool:  # make() drops lights that light nothing, so a batch can come back short
+        l, im = producer.make(min(10, args.pool - filled))
+        l, im = l[:args.pool - filled], im[:args.pool - filled]
+        pool[filled:filled + len(l)] = im.reshape(len(l), NP, 3)
+        pool_lights[filled:filled + len(l)] = l
+        pool_mean[filled:filled + len(l)] = im.reshape(len(l), -1).float().mean(1)
+        filled += len(l)
     print(f"initial pool of {args.pool} built in {time.time() - t0:.1f}s", flush=True)
     producer.start()
 
@@ -200,13 +243,33 @@ def main():
         return float(np.mean(p_den)), float(np.mean(p_raw))
 
     log = []
+    start = 1
+    ckpt = out_dir / "checkpoint.pt"
+    if args.resume and ckpt.exists():
+        c = torch.load(ckpt, weights_only=False)
+        model.load_state_dict(c["state"])
+        opt.load_state_dict(c["opt"])
+        start, log = c["it"] + 1, c["log"]
+        if refresh:
+            n_done[0] = c.get("refreshed", 0)
+        print(f"resumed from iteration {c['it']}", flush=True)
+
+    def save_checkpoint(it):
+        tmp = ckpt.with_suffix(".tmp")
+        torch.save({"state": model.state_dict(), "opt": opt.state_dict(), "it": it, "log": log,
+                    "refreshed": n_done[0] if refresh else 0}, tmp)
+        tmp.replace(ckpt)  # never leave a half-written checkpoint behind
+
     t0 = time.time()
     swapped = 0
-    for it in range(1, args.iters + 1):
+    for it in range(start, args.iters + 1):
         # Cosine decay to 5% of the base learning rate.
         f = 0.05 + 0.95 * 0.5 * (1 + np.cos(np.pi * it / args.iters))
         for g, lr in zip(opt.param_groups, base_lrs):
             g["lr"] = lr * f
+
+        if refresh and it % args.refresh == 0:
+            refresh()
 
         if it % args.replace_every == 0:
             try:
@@ -214,6 +277,7 @@ def main():
                 slots = torch.randint(0, args.pool, (len(l),), device="cuda")
                 pool[slots] = im.reshape(len(l), NP, 3)
                 pool_lights[slots] = l
+                pool_mean[slots] = im.reshape(len(l), -1).float().mean(1)
                 swapped += len(l)
             except queue.Empty:
                 pass
@@ -222,7 +286,8 @@ def main():
         k = torch.randint(0, args.pool, (args.batch,), device="cuda")
         target = pool[k, pix].float()
         pred = run_model(model, bufs, pix, pool_lights[k])
-        per = (pred - target) ** 2 / (pred.detach() ** 2 + args.rel_eps)
+        eps = (args.eps_scale * pool_mean[k]).pow(2)[:, None] if args.eps_scale else args.rel_eps
+        per = (pred - target) ** 2 / (pred.detach() ** 2 + eps)
         loss = per.mean()
         if args.adapt > 0:
             with torch.no_grad():
@@ -243,13 +308,17 @@ def main():
 
         if it % 500 == 0 or it == args.iters:
             torch.cuda.synchronize()
-            msg = f"it {it:6d}  loss {loss.item():.4f}  {(time.time() - t0) / it * 1000:.1f} ms/it  swapped {swapped}"
+            msg = f"it {it:6d}  loss {loss.item():.4f}  {(time.time() - t0) / (it - start + 1) * 1000:.1f} ms/it  swapped {swapped}"
+            if refresh:
+                msg += f"  refreshed {n_done[0] * args.refresh_spp} spp"
             if it % 2500 == 0 or it == args.iters:
                 pd_, pr_ = validate()
                 msg += f"  | val PSNR(tm) vs denoised {pd_:.2f} dB, vs raw {pr_:.2f} dB"
                 log.append({"it": it, "loss": loss.item(), "psnr_den": pd_, "psnr_raw": pr_,
                             "time": time.time() - t0})
             print(msg, flush=True)
+        if args.checkpoint_every and it % args.checkpoint_every == 0 and it < args.iters:
+            save_checkpoint(it)
 
     producer.stop.set()
     torch.save({"state": model.state_dict(), "cfg": model.cfg, "meta": meta, "args": vars(args), "log": log},

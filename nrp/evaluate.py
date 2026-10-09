@@ -24,7 +24,7 @@ import scenes
 from common import WORK_DIR, load_meta, scene_dir
 from denoise import make_denoiser
 from direct import direct_view
-from gather import PathData, gather_arrays
+from gather import PathData, gather_arrays, medium_delta
 from model import NRP, PixelBuffers, predict_image
 
 def eval_lights(meta, n, seed):
@@ -48,10 +48,11 @@ def reference(scene_name, meta, lights, spp, chunk=16):
     acc = torch.zeros(len(lights), NP, 3, device="cuda")
     t0 = time.time()
     for s0 in range(0, spp, chunk):
-        v, t = sample_paths.trace_chunk(scene, sensor, (W, H), chunk, seed=10_000_000 + s0, max_seg=D)
+        v, t = sample_paths.trace_chunk(scene, sensor, (W, H), chunk, seed=10_000_000 + s0, max_seg=D,
+                                        medium=meta.get("medium"))
         V = torch.from_numpy(v).cuda().half()
-        T = torch.from_numpy(np.minimum(t, 6e4)).cuda().half()
-        acc += gather_arrays(V, T, NP, chunk, lights, first_seg=1)
+        T = torch.from_numpy(np.clip(t, -6e4, 6e4)).cuda().half()
+        acc += gather_arrays(V, T, NP, chunk, lights, first_seg=1, delta=medium_delta(meta.get("medium")))
         if (s0 // chunk) % 16 == 0:
             print(f"  reference spp {s0 + chunk}/{spp} ({time.time() - t0:.0f}s)", flush=True)
     return acc / (spp // chunk)

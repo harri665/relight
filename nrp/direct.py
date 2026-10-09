@@ -23,7 +23,9 @@ def camera_rays(meta, uv):
 
 def direct_view(meta, aux, light, ss=4):
     """Coverage of the light disc per pixel, [H*W, 1], averaged over ss x ss subpixels.
-    aux: [H, W, 10]; pixels without geometry (distance 0) count as unoccluded."""
+    aux: [H, W, 10]; pixels without geometry (distance 0) count as unoccluded. With the camera
+    in a medium (meta["medium"]["camera"] == "water") the disc is dimmed by exp(-sigma_t * t)
+    per channel, and the result is [H*W, 3]."""
     H, W = meta["height"], meta["width"]
     dev = aux.device
     ys, xs = torch.meshgrid(torch.arange(H, device=dev), torch.arange(W, device=dev), indexing="ij")
@@ -39,4 +41,9 @@ def direct_view(meta, aux, light, ss=4):
     dist = torch.where(aux[..., 9] > 0, (aux[..., 6:9] - org).norm(dim=-1), torch.zeros_like(aux[..., 9]))
     surf = torch.where(dist > 0, dist, torch.full_like(dist, 1e9))[..., None, None]
     hit = (disc >= 0) & (t0 > 0) & (t0 < surf)
+    medium = meta.get("medium")
+    if medium and medium.get("camera") == "water":
+        st = torch.tensor(medium["sigma_t"], dtype=torch.float32, device=dev)
+        att = torch.exp(-st * t0.clamp_min(0)[..., None]) * hit[..., None]  # H W ss ss 3
+        return att.mean((2, 3)).reshape(-1, 3)
     return hit.float().mean((-1, -2)).reshape(-1, 1)
