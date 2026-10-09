@@ -1,4 +1,5 @@
 import { useRelighter } from '../../relight/useRelighter.js'
+import { AUTO } from '../../relight/relighter.js'
 import { fmt } from '../../relight/color.js'
 import { Button, Segmented } from '../ui.jsx'
 
@@ -27,7 +28,14 @@ export default function AccuracyPanel() {
   const refs = r.scene.refs
   const { refIndex } = r.state
   if (!refs.length) {
-    return <p className="text-dim">No reference renders at this resolution. Switch to the native resolution to compare against them.</p>
+    return (
+      <>
+        <p className="mb-3 text-dim">The reference renders are at the size the paths were traced at, not this one.</p>
+        <Button small disabled={!!r.swapping} onClick={() => (AUTO ? r.swapEngine({ res: null }) : r.reloadWith({ res: 'native' }))}>
+          {r.swapping ? 'Loading…' : 'Switch to the native size'}
+        </Button>
+      </>
+    )
   }
   return (
     <>

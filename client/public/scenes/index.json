@@ -6,7 +6,9 @@
   "tiers": [
    384,
    768
-  ]
+  ],
+  "family": "cornell",
+  "size": 512
  },
  {
   "name": "cornell",
@@ -15,12 +17,16 @@
   "tiers": [
    384,
    768
-  ]
+  ],
+  "family": "cornell",
+  "size": 512
  },
  {
   "name": "cornell-hq",
   "label": "Cornell \u00b7 quality (256\u00d74)",
-  "network": "256x4"
+  "network": "256x4",
+  "family": "cornell",
+  "size": 512
  },
  {
   "name": "bathroom",
@@ -29,26 +35,36 @@
   "tiers": [
    384,
    768
-  ]
+  ],
+  "family": "bathroom",
+  "size": 512
  },
  {
   "name": "bathroom-hq",
   "label": "Bathroom \u00b7 quality (256\u00d74)",
-  "network": "256x4"
+  "network": "256x4",
+  "family": "bathroom",
+  "size": 512
  },
  {
   "name": "still_life",
   "label": "Caustics still life \u00b7 rough (128\u00d74)",
-  "network": "128x4"
+  "network": "128x4",
+  "family": "still_life",
+  "size": 512
  },
  {
   "name": "flooded_canoe_cave",
   "label": "Flooded canoe cave \u00b7 fast (128\u00d74)",
-  "network": "128x4"
+  "network": "128x4",
+  "family": "flooded_canoe_cave",
+  "size": 512
  },
  {
   "name": "flooded_canoe_cave-hq",
   "label": "Flooded canoe cave \u00b7 quality (256\u00d74)",
-  "network": "256x4"
+  "network": "256x4",
+  "family": "flooded_canoe_cave",
+  "size": 512
  }
 ]

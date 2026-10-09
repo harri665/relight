@@ -6,14 +6,28 @@ import { MIN_BAND_ROWS } from "../engine/engine-base.js";
 import { hexToRgb, rgbToHex, srgbToLin, fmt } from "./color.js";
 import {
   AdaptiveQuality, previewStride, refineStride, benchStride, gpuName, loadProfile, saveProfile, seedCosts, measuredCosts,
+  upgradeTier, nextVisitTier, switchNetwork, networkKey, NETWORKS, compactDevice, slowConnection,
 } from "./quality.js";
 
 const params = new URLSearchParams(location.search);
 // Without ?scene=, the first load picks "cornell" or else the first scene in the index (see resolveScene).
 export let SCENE = params.get("scene") || "";
 export const BACKEND = params.get("backend");  // "webgpu" or "webgl" forces one
-export const RES = Number(params.get("res")) || null;  // alternative image size, see export.py --res
+// ?res=N pins an image size exported with export.py --res N, and ?res=native the size the paths were
+// traced at. Without it the size follows the GPU (AUTO): a first visit starts at the native size (the
+// smallest on phones and slow connections), a larger one is fetched in the background if the GPU has
+// room for it, and the next visit starts at the size this one settled on.
+export let RES = Number(params.get("res")) || null;
+export const AUTO = !params.get("res");
+// A scene the viewer picked itself (no ?scene=) also changes to the lighter network of the same scene
+// on a GPU too slow to refine the larger one past every 4th pixel (quality.js switchNetwork).
+const AUTO_NETWORK = AUTO && !params.get("scene");
 export { MAX_LIGHTS };
+
+/** Exports of the same scene (other networks), and the image sizes an export comes in. */
+export const familyOf = (e) => e?.family ?? e?.name.replace(/-(hq|lite)$/, "");
+export const nativeOf = (e) => e?.size ?? 512;
+export const tiersOf = (e) => [...new Set([nativeOf(e), ...(e?.tiers ?? [])])].sort((a, b) => a - b);
 
 // While lights change, a light whose full-resolution evaluation would not fit the network's budget for
 // a frame (quality.js) is evaluated on every s-th pixel instead (a preview, upsampled along the
@@ -37,13 +51,6 @@ const FALLBACK_LIGHTS = [
   { name: "Key", pos: [0.1, 0.8, 0.1], radius: 0.12, color: [1, 0.86, 0.68], intensity: 18 },
   { name: "Fill", pos: [-0.72, 0.15, 0.75], radius: 0.09, color: [0.6, 0.75, 1], intensity: 10 },
 ];
-
-async function resolveScene() {
-  if (SCENE) return;
-  let index = [];
-  try { index = await (await fetch("/scenes/index.json")).json(); } catch { /* fall through to cornell */ }
-  SCENE = index.some((s) => s.name === "cornell") ? "cornell" : index[0]?.name ?? "cornell";
-}
 
 export const HELP_HINT = "drag lights · wheel = depth · shift+wheel = radius · double-click a surface to place";
 
@@ -87,13 +94,19 @@ class Relighter {
     this.started = false;
     this.raf = 0;
     this.frames = 0; this.lastFps = performance.now();
-    this.lastChange = 0; this.lastFrame = 0;
+    this.lastChange = 0; this.lastFrame = 0; this.sinceProbe = 0;
     // the slot a resting light is refined into (see refine), and that refinement
     this.spare = SPARE;
     this.refining = null;
     this.quality = new AdaptiveQuality();
     this.gpu = null;
     this.savedAt = 0;
+    // scene index, and changing image size, network or backend in place (see adapt, swapEngine)
+    this.index = [];
+    this.swapping = null;
+    this.upgradeFailed = false;
+    this.adaptedAt = 0;
+    this.notGPU = null;
     this.loop = this.loop.bind(this);
     this.resizeObserver = new ResizeObserver(() => this.resizeOverlay());
   }
@@ -131,9 +144,38 @@ class Relighter {
     this.overlay.remove();
   }
 
+  /**
+   * Picks the scene and image size to start with: ?scene= or "cornell" (or the first in the index),
+   * and in AUTO mode the size, and for a scene picked here the network, an earlier visit settled on.
+   */
+  async resolveScene() {
+    try { this.index = await (await fetch("/scenes/index.json")).json(); } catch { /* no index: just the scene */ }
+    if (!SCENE) SCENE = this.index.some((s) => s.name === "cornell") ? "cornell" : this.index[0]?.name ?? "cornell";
+    let entry = this.index.find((e) => e.name === SCENE);
+    if (!entry) return;
+    const fam = familyOf(entry);
+    const net = this.profile?.networks?.[fam];
+    if (AUTO_NETWORK && NETWORKS.includes(entry.network) && NETWORKS.includes(net)) {
+      const sibling = this.siblings(entry).find((e) => e.network === net);
+      if (sibling) { SCENE = sibling.name; entry = sibling; }
+    }
+    if (!AUTO) return;
+    const tiers = tiersOf(entry), native = nativeOf(entry);
+    let tier = this.profile?.tiers?.[fam];
+    // the largest size is only ever reached by timing the GPU
+    if (!tiers.includes(tier)) tier = compactDevice() || slowConnection() ? Math.min(native, tiers[0]) : native;
+    RES = tier === native ? null : tier;
+  }
+
+  get entry() { return this.index.find((e) => e.name === SCENE); }
+  siblings(entry = this.entry) { return this.index.filter((e) => familyOf(e) === familyOf(entry)); }
+  /** Image sizes of the current scene, and its native one. */
+  get tiers() { return tiersOf(this.entry); }
+  get native() { return nativeOf(this.entry); }
+
   /** WebGPU first, then WebGL2. Returns the first backend that loads the scene. */
   async startEngine(setMsg) {
-    await resolveScene();
+    await this.resolveScene();
     const failed = [];
     for (const [name, Engine] of [["WebGPU", NRPEngine], ["WebGL2", GLEngine]]) {
       if (BACKEND && !name.toLowerCase().startsWith(BACKEND.toLowerCase())) continue;
@@ -146,6 +188,7 @@ class Relighter {
       } catch (err) {
         console.warn(`${name} failed:`, err);
         failed.push(`${name}: ${err.message}`);
+        if (Engine === NRPEngine) this.notGPU = `WebGPU couldn't start (${err.message})`;
         e?.device?.destroy();
         // A canvas keeps the first kind of context it was given, so the next backend gets a fresh one.
         const fresh = this.gpuCanvas.cloneNode(false);
@@ -158,6 +201,10 @@ class Relighter {
 
   async start() {
     const setMsg = (m) => { this.status = { phase: "loading", message: m }; this.emit(); };
+    // What an earlier visit learned on this GPU: the network's budget and costs, the image size and network.
+    this.gpu = gpuName();
+    this.profile = loadProfile(this.gpu);
+    if (BACKEND === "webgl") this.notGPU = "the page was asked for WebGL (?backend=webgl)";
     try {
       [this.engine, this.scene] = await this.startEngine(setMsg);
     } catch (e) {
@@ -170,14 +217,11 @@ class Relighter {
       return;
     }
     const engine = this.engine;
-    const gpu = engine.adapterInfo.description || engine.adapterInfo.architecture;
-    this.stats.gpu = gpu ? `${engine.backend} · ${gpu}` : engine.backend;
-    this.W = engine.W; this.H = engine.H; this.NP = engine.NP;
+    this.adoptEngine(engine);
     this.paint.canvas.width = this.W; this.paint.canvas.height = this.H;
     this.paint.ctx = this.paint.canvas.getContext("2d", { willReadFrequently: true });
-    // What an earlier visit learned on this GPU: the network's budget and its costs.
-    this.gpu = gpuName() || this.stats.gpu;
-    this.profile = loadProfile(this.gpu);
+    this.gpu ||= this.stats.gpu;
+    this.fromProfile = !!this.profile;
     this.quality = new AdaptiveQuality({ budget: this.profile?.budget });
     seedCosts(engine, this.profile);
     this.readyAt = performance.now();
@@ -189,6 +233,91 @@ class Relighter {
     this.resizeOverlay();
     this.emit();
     window.nrp = { relighter: this, engine, state: this.state };  // handy for scripting / debugging
+  }
+
+  /** Makes `engine` the one the viewer runs: sizes, GPU name, and falling back to WebGL if its device is lost. */
+  adoptEngine(engine) {
+    this.engine = engine;
+    this.scene = engine.scene;
+    this.W = engine.W; this.H = engine.H; this.NP = engine.NP;
+    const gpu = engine.adapterInfo.description || engine.adapterInfo.architecture;
+    this.stats.gpu = gpu ? `${engine.backend} · ${gpu}` : engine.backend;
+    engine.onLost = (info) => {
+      this.notGPU = `its WebGPU device was lost (${info.message || info.reason})`;
+      this.swapEngine({ Engine: GLEngine });
+    };
+    if (window.nrp) window.nrp.engine = engine;
+  }
+
+  /**
+   * Loads `name` at image size `res` (null: native) with `Engine`, on a canvas of its own, and swaps
+   * it in for the running engine, keeping the lights (exports of the same scene share their light
+   * space). The old engine runs until then. Returns whether it swapped.
+   */
+  async swapEngine({ name = SCENE, res = RES, Engine = this.engine.constructor } = {}) {
+    if (this.swapping) return false;
+    this.swapping = { name, res, backend: Engine === NRPEngine ? "WebGPU" : "WebGL2" };
+    this.emit();
+    const canvas = this.makeCanvas();
+    let e = null;
+    try {
+      e = await Engine.create(canvas);
+      await e.load(`/scenes/${name}`, () => {}, res);
+      if (this.state.optimizing) throw new Error("the optimizer started");
+      const old = this.engine;
+      seedCosts(e, measuredCosts(old));
+      this.adoptEngine(e);
+      SCENE = name; RES = res;
+      this.gpuCanvas.replaceWith(canvas);
+      this.gpuCanvas = canvas;
+      // paint strokes and a target image follow the new size
+      const strokes = document.createElement("canvas");
+      strokes.width = this.paint.canvas.width; strokes.height = this.paint.canvas.height;
+      strokes.getContext("2d").drawImage(this.paint.canvas, 0, 0);
+      this.paint.canvas.width = this.W; this.paint.canvas.height = this.H;
+      this.paint.ctx.drawImage(strokes, 0, 0, this.W, this.H);
+      if (this.targetSource) this.fitTarget();
+      e.exposure = 2 ** this.ui.exposure;
+      this.refining = null;
+      this.spare = SPARE;
+      this.onLightsChanged();
+      this.resizeOverlay();
+      old.dispose();
+      return true;
+    } catch (err) {
+      console.warn(`staying at ${this.W} px (${this.swapping.backend}, ${name} at ${res ?? "native size"}):`, err);
+      try { e?.dispose(); } catch { /* never got that far */ }
+      this.upgradeFailed = true;
+      return false;
+    } finally {
+      this.swapping = null;
+      this.emit();
+    }
+  }
+
+  /**
+   * In AUTO mode, about once a second once the scene has settled: changes to the lighter network of
+   * this scene if the GPU can't refine this one (only for a scene the viewer picked), or else fetches
+   * a larger image size if the GPU has room for it and the screen shows the image larger than now.
+   */
+  adapt(now) {
+    const { engine, quality, state } = this;
+    if (!AUTO || this.swapping || this.upgradeFailed || state.optimizing || state.tab === "compare") return;
+    if (now - this.readyAt < 2000 || now - this.adaptedAt < 1000) return;
+    this.adaptedAt = now;
+    if (AUTO_NETWORK) {
+      const net = switchNetwork(engine, quality.budget);
+      const sibling = net && this.siblings().find((e) => e.network === net);
+      if (sibling) {
+        const res = tiersOf(sibling).includes(this.W) && this.W !== nativeOf(sibling) ? this.W : null;
+        this.swapEngine({ name: sibling.name, res });
+        return;
+      }
+    }
+    const r = this.overlay.getBoundingClientRect();
+    const shownPx = Math.max(r.width, r.height) * Math.min(devicePixelRatio || 1, 2);
+    const tier = upgradeTier(engine, this.tiers, quality.budget, shownPx);
+    if (tier) this.swapEngine({ res: tier === this.native ? null : tier });
   }
 
   // ---------------------------------------------------------------- lights
@@ -489,18 +618,24 @@ class Relighter {
     this.drawOverlay();
   }
   async loadTarget(file) {
-    const { W, H } = this;
     const bmp = await createImageBitmap(file);
+    this.targetSource = bmp;
+    this.fitTarget();
+    this.optStatus = `target image loaded (${bmp.width}×${bmp.height}); press Optimize`;
+    this.emit();
+  }
+  /** The target image cropped and scaled to the image size. */
+  fitTarget() {
+    const { W, H } = this, bmp = this.targetSource;
     const c = document.createElement("canvas"); c.width = W; c.height = H;
     const cx = c.getContext("2d");
     const sc = Math.max(W / bmp.width, H / bmp.height);
     cx.drawImage(bmp, (W - bmp.width * sc) / 2, (H - bmp.height * sc) / 2, bmp.width * sc, bmp.height * sc);
     this.targetImg = cx.getImageData(0, 0, W, H).data;
-    this.optStatus = `target image loaded (${bmp.width}×${bmp.height}); press Optimize`;
-    this.emit();
   }
   clearTarget() {
     this.targetImg = null;
+    this.targetSource = null;
     this.optStatus = "";
     this.emit();
   }
@@ -660,7 +795,12 @@ class Relighter {
   planPreview() {
     const dirty = this.state.lights.filter((l) => l.dirty);
     if (!dirty.length) return;
-    const s = previewStride(this.engine, this.quality.budget / dirty.length);
+    const budget = this.quality.budget / dirty.length;
+    let s = previewStride(this.engine, budget);
+    // Costs timed while the lights rested ran on a GPU clocked down (an RTX 3080 took 55 ms for a
+    // light it takes 6 for when busy), and preview work at a coarse stride never clocks it up. So
+    // every few frames the next finer stride is tried if it is plausibly close to the budget.
+    if (s > 1 && ++this.sinceProbe >= 8 && this.engine.evalCost(s / 2) <= 3 * budget) { this.sinceProbe = 0; s /= 2; }
     dirty.forEach((l) => (l.stride = s));
     if (dirty.includes(this.refining?.light)) this.refining = null;
     this.lastChange = performance.now();
@@ -715,10 +855,19 @@ class Relighter {
     return true;
   }
 
+  /** Keeps what this visit learned for the next: per scene, the size and network it settled on. */
   saveProfile() {
     const { engine, quality } = this;
-    if (!engine || !Object.keys(engine.timing.byStride).length) return;
-    saveProfile({ gpu: this.gpu, fps: 30, ...measuredCosts(engine), budget: quality.budget });
+    if (!engine?.scene) return;
+    const prev = this.profile ?? {}, fam = familyOf(this.entry), net = networkKey(engine);
+    // an engine not timed yet keeps the costs measured before
+    const costs = Object.keys(engine.timing.byStride).length && !engine.timing.seeded ? measuredCosts(engine) : {};
+    this.profile = {
+      ...prev, gpu: this.gpu, fps: 30, ...costs, budget: quality.budget,
+      tiers: { ...prev.tiers, ...(AUTO && fam && { [fam]: nextVisitTier(engine, this.tiers, quality.budget) }) },
+      networks: { ...prev.networks, ...(AUTO_NETWORK && fam && NETWORKS.includes(net) && { [fam]: net }) },
+    };
+    saveProfile(this.profile);
   }
 
   // ---------------------------------------------------------------- main loop
@@ -728,7 +877,8 @@ class Relighter {
     this.lastFrame = now;
     if (this.ready) {
       engine.pollTiming();
-      quality.frame(delta, now - this.readyAt > SETTLE_MS, state.optimizing);
+      quality.frame(delta, now - this.readyAt > SETTLE_MS, state.optimizing || !!this.swapping);
+      this.adapt(now);
       let worked = false;
       if (state.needsRender) {
         state.needsRender = false;

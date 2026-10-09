@@ -224,8 +224,11 @@ def main():
     # Register in the viewer's scene index (keeping any other exported sizes).
     tiers = next((e.get("tiers") for e in index if e["name"] == name), None)
     index = [e for e in index if e["name"] != name]
+    # family: exports of the same scene (the viewer switches between their networks); size: the
+    # native image size, beside the other sizes in tiers
     index.append({"name": name, "label": args.label or f"{meta['scene']} · {cfg['width']}×{cfg['hidden']}",
-                  "network": f"{cfg['width']}x{cfg['hidden']}", **({"tiers": tiers} if tiers else {})})
+                  "network": f"{cfg['width']}x{cfg['hidden']}", "family": meta["scene"], "size": W,
+                  **({"tiers": tiers} if tiers else {})})
     index_path.write_text(json.dumps(sorted(index, key=lambda e: e["name"]), indent=1))
     sizes = {f: (out / f).stat().st_size / 1e6 for f in ["model.bin", "pixels.bin", "refs.bin"]}
     print(f"exported {out}: " + ", ".join(f"{k} {v:.1f} MB" for k, v in sizes.items()))

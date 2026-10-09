@@ -160,6 +160,7 @@ export class EngineBase {
 
     const W = scene.width, H = scene.height, NP = W * H;
     this.W = W; this.H = H; this.NP = NP;
+    this.canvas.width = W; this.canvas.height = H;
 
     let gridLen = 0;
     const gridOff = scene.model.grids.map((g) => { const o = gridLen; gridLen += g.shape[0] * g.shape[1] * g.shape[2]; return o; });

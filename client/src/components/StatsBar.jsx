@@ -1,6 +1,5 @@
-import { useEffect, useState } from 'react'
 import { useRelighter } from '../relight/useRelighter.js'
-import { SCENE, BACKEND, RES } from '../relight/relighter.js'
+import { SCENE, BACKEND, RES, AUTO, tiersOf, nativeOf } from '../relight/relighter.js'
 import { fmt } from '../relight/color.js'
 import { Segmented } from './ui.jsx'
 
@@ -9,23 +8,16 @@ const hasWebGL2 = (() => {
   try { return !!document.createElement('canvas').getContext('webgl2') } catch { return false }
 })()
 
-function useSceneIndex() {
-  const [scenes, setScenes] = useState([])
-  useEffect(() => {
-    fetch('/scenes/index.json')
-      .then((res) => (res.ok ? res.json() : []))
-      .then(setScenes)
-      .catch(() => {})
-  }, [])
-  return scenes
-}
-
 const SELECT = 'rounded border border-line bg-[#f3f4f6] px-1.5 py-0.5 text-xs text-fg'
 
 export default function StatsBar() {
   const r = useRelighter()
-  const scenes = useSceneIndex()
-  const tiers = scenes.find((s) => s.name === SCENE)?.tiers ?? []
+  const scenes = r.index
+  const entry = scenes.find((s) => s.name === SCENE)
+  const tiers = tiersOf(entry), native = nativeOf(entry)
+  // '' = auto (the size follows the GPU), 'native', or a pinned size
+  const size = AUTO ? '' : RES ?? 'native'
+  const shown = r.W ? `${r.W} × ${r.H}` : '…'
   const want = (BACKEND || '').toLowerCase()
   const backends = [
     { value: '', label: r.engine && !want ? `Auto (${r.engine.backend})` : 'Auto' },
@@ -42,10 +34,10 @@ export default function StatsBar() {
           {scenes.map((s) => <option key={s.name} value={s.name}>{s.label}</option>)}
         </select>
       )}
-      {tiers.length > 0 && (
-        <select title="image size (smaller is faster on weak GPUs)" className={SELECT} value={RES ?? ''} onChange={(e) => r.reloadWith({ res: e.target.value })}>
-          <option value="">native size</option>
-          {tiers.map((t) => <option key={t} value={t}>{t} × {t}</option>)}
+      {entry && tiers.length > 1 && (
+        <select title="image size: auto follows what the GPU can take (smaller is faster on weak GPUs)" className={SELECT} value={size} onChange={(e) => r.reloadWith({ res: e.target.value })}>
+          <option value="">auto ({r.swapping ? `${shown}, loading another` : shown})</option>
+          {tiers.map((t) => <option key={t} value={t === native ? 'native' : t}>{t} × {t}{t === native ? ' (native)' : ''}</option>)}
         </select>
       )}
       <span><b className="font-normal text-fg">{r.stats.fps ?? '–'}</b> fps</span>
