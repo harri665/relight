@@ -301,6 +301,17 @@ export class EngineBase {
     return r4;
   }
 
+  /**
+   * Sizes the canvas to the pixels it is shown at (never below the image's own size: smaller, the
+   * browser scales it down), and draws the image to it again; the engine upscales it (present).
+   */
+  setDisplaySize(w, h) {
+    w = Math.max(this.W, Math.round(w)); h = Math.max(this.H, Math.round(h));
+    if (this.canvas.width === w && this.canvas.height === h) return;
+    this.canvas.width = w; this.canvas.height = h;
+    if (this.composited) this.present();
+  }
+
   /** Evaluates the dirty lights (each at its stride) and composites. */
   render(lights) {
     for (const l of lights) {

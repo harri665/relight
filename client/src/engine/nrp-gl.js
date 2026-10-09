@@ -287,6 +287,38 @@ void main() {
   disp = vec4(clamp(srgb(c), 0.0, 1.0), 1.0);
 }`;
 
+// Draws the display image to a canvas of any size, upscaled with Catmull-Rom (5 bilinear taps),
+// held within the 4 nearest pixels so the light's disc doesn't ring dark. Texture rows are image rows
+// (top first) and the canvas has y up, so it flips.
+const presentFS = HEAD + `
+uniform sampler2D img; uniform vec2 texSize, viewSize;
+out vec4 color;
+vec3 sharpSample(vec2 uv) {
+  vec2 pos = uv * texSize;
+  vec2 c = floor(pos - 0.5) + 0.5;
+  vec2 f = pos - c;
+  vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+  vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+  vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+  vec2 w3 = f * f * (-0.5 + 0.5 * f);
+  vec2 w12 = w1 + w2;
+  vec2 t0 = (c - 1.0) / texSize, t3 = (c + 2.0) / texSize, t12 = (c + w2 / w12) / texSize;
+  vec3 sum = texture(img, vec2(t12.x, t0.y)).rgb * (w12.x * w0.y)
+    + texture(img, vec2(t0.x, t12.y)).rgb * (w0.x * w12.y)
+    + texture(img, t12).rgb * (w12.x * w12.y)
+    + texture(img, vec2(t3.x, t12.y)).rgb * (w3.x * w12.y)
+    + texture(img, vec2(t12.x, t3.y)).rgb * (w12.x * w3.y);
+  float weight = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;
+  vec2 a = c / texSize, b = (c + 1.0) / texSize;
+  vec3 p00 = texture(img, a).rgb, p10 = texture(img, vec2(b.x, a.y)).rgb;
+  vec3 p01 = texture(img, vec2(a.x, b.y)).rgb, p11 = texture(img, b).rgb;
+  return clamp(sum / weight, min(min(p00, p10), min(p01, p11)), max(max(p00, p10), max(p01, p11)));
+}
+void main() {
+  vec2 uv = gl_FragCoord.xy / viewSize;
+  color = vec4(sharpSample(vec2(uv.x, 1.0 - uv.y)), 1.0);
+}`;
+
 /**
  * A layer's weights split into passes of `out` output groups. Uniform block of pass p:
  * w[(k * out + j) * 4 + c] = weights from input (group k, component c) to outputs 4(p*out + j) .. +3.
@@ -438,6 +470,10 @@ export class GLEngine extends EngineBase {
     this.subFbo = this.fbo([[subOut]]);
     const dispTex = tex(T2, gl.RGBA8, W, H), hdrTex = tex(T2, this.f32 ? gl.RGBA32F : gl.RGBA16F, W, H);
     this.dispTex = dispTex;
+    // presented with filtering (see presentFS)
+    gl.bindTexture(T2, dispTex);
+    gl.texParameteri(T2, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(T2, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     this.compFbo = this.fbo([[dispTex], [hdrTex]]);
     this.dispFbo = this.fbo([[dispTex]]);
     this.hdrFbo = this.fbo([[hdrTex]]);
@@ -445,6 +481,7 @@ export class GLEngine extends EngineBase {
     // --- programs and activation buffers
     onProgress("compiling shaders");
     this.pComp = this.program(compositeFS(W, H, mul), "composite");
+    this.pPresent = this.program(presentFS, "present");
     const evaluator = (fmt, out, weights, gw, rows, items) => {
       const th = Math.max(8, Math.min(rows, Math.floor(BAND_BYTES / (gw * G * fmt.bytes))));
       const arrs = [0, 1].map(() => tex(A2, fmt.ifmt, gw, th, G));
@@ -590,7 +627,7 @@ export class GLEngine extends EngineBase {
     const bi = gl.getUniformBlockIndex(p, "Wt");
     if (bi !== gl.INVALID_INDEX) gl.uniformBlockBinding(p, bi, 0);
     gl.useProgram(p);
-    for (const [name, unit] of [["src", 0], ["outT", 0], ["idxT", 1], ["posT", 2], ["refT", 3], ["auxT", 4], ["gridT", 6]]) {
+    for (const [name, unit] of [["src", 0], ["outT", 0], ["idxT", 1], ["posT", 2], ["refT", 3], ["auxT", 4], ["img", 5], ["gridT", 6]]) {
       if (u[name]) gl.uniform1i(u[name], unit);
     }
     if (u.posMap) { gl.uniform2fv(u.posMap, this.posMap); gl.uniform3fv(u.camO, this.cam.O); }
@@ -795,17 +832,21 @@ export class GLEngine extends EngineBase {
     gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, this.compFbo);
     gl.viewport(0, 0, W, H);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+    this.composited = true;
     this.present();
   }
 
-  /** Draws the last composited image to the canvas. */
+  /** Draws the last composited image to the canvas, at the canvas's size. */
   present() {
-    const gl = this.gl, { W, H } = this;
-    // Texture rows are image rows (top first); the canvas has y up, so flip while copying.
-    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, this.dispFbo);
+    const gl = this.gl, { u, p } = this.pPresent, cw = this.canvas.width, ch = this.canvas.height;
+    gl.useProgram(p);
+    gl.uniform2f(u.texSize, this.W, this.H);
+    gl.uniform2f(u.viewSize, cw, ch);
+    gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, this.dispTex);
+    gl.bindVertexArray(this.vao);
     gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
-    gl.blitFramebuffer(0, 0, W, H, 0, H, W, 0, gl.COLOR_BUFFER_BIT, gl.NEAREST);
-    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+    gl.viewport(0, 0, cw, ch);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
 
   /** Current display image as RGBA bytes. */

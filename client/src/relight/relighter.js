@@ -571,6 +571,9 @@ class Relighter {
   resizeOverlay() {
     const r = this.overlay.getBoundingClientRect(), dpr = devicePixelRatio || 1;
     this.overlay.width = Math.round(r.width * dpr); this.overlay.height = Math.round(r.height * dpr);
+    // the image is drawn at the screen's pixels (up to 2x), upscaled with Catmull-Rom
+    const scale = Math.min(dpr, 2);
+    this.engine?.setDisplaySize(r.width * scale, r.height * scale);
     this.drawOverlay();
   }
   drawOverlay() {

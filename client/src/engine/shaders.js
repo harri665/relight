@@ -588,17 +588,36 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 }
 `;
 
+  // Draws the display image to a canvas of any size (view.xy), upscaled with Catmull-Rom, held within
+  // the 4 nearest pixels so the light's disc doesn't ring dark. At the image's own size it copies.
   const blit = /* wgsl */ `
 @group(0) @binding(0) var<storage, read> disp: array<u32>;
+@group(0) @binding(1) var<uniform> view: vec4f;
 struct VO { @builtin(position) pos: vec4f };
 @vertex fn vs(@builtin(vertex_index) i: u32) -> VO {
   var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
   var o: VO; o.pos = vec4f(p[i], 0.0, 1.0); return o;
 }
+fn texel(x: i32, y: i32) -> vec3f {
+  let c = disp[u32(clamp(y, 0, ${H - 1})) * ${u(W)} + u32(clamp(x, 0, ${W - 1}))];
+  return vec3f(f32(c & 255u), f32((c >> 8u) & 255u), f32((c >> 16u) & 255u)) / 255.0;
+}
+fn catmullRom(t: f32) -> vec4f {
+  return vec4f(t * (-0.5 + t * (1.0 - 0.5 * t)), 1.0 + t * t * (-2.5 + 1.5 * t), t * (0.5 + t * (2.0 - 1.5 * t)), t * t * (-0.5 + 0.5 * t));
+}
 @fragment fn fs(v: VO) -> @location(0) vec4f {
-  let x = min(u32(v.pos.x), ${u(W - 1)}); let y = min(u32(v.pos.y), ${u(H - 1)});
-  let c = disp[y * ${u(W)} + x];
-  return vec4f(f32(c & 255u), f32((c >> 8u) & 255u), f32((c >> 16u) & 255u), 255.0) / 255.0;
+  let p = v.pos.xy / view.xy * vec2f(${f(W)}, ${f(H)}) - 0.5;
+  let b = floor(p);
+  let ix = i32(b.x); let iy = i32(b.y);
+  let wx = catmullRom(p.x - b.x); let wy = catmullRom(p.y - b.y);
+  var acc = vec3f(0.0);
+  for (var j = 0; j < 4; j++) {
+    var row = vec3f(0.0);
+    for (var i = 0; i < 4; i++) { row += wx[i] * texel(ix + i - 1, iy + j - 1); }
+    acc += wy[j] * row;
+  }
+  let a = texel(ix, iy); let c = texel(ix + 1, iy); let d = texel(ix, iy + 1); let e = texel(ix + 1, iy + 1);
+  return vec4f(clamp(acc, min(min(a, c), min(d, e)), max(max(a, c), max(d, e))), 1.0);
 }
 `;
 

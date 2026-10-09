@@ -138,6 +138,7 @@ export class NRPEngine extends EngineBase {
     this.dispBuf = buf(NP * 4, ST);
     this.hdrBuf = buf(NP * 16, ST);
     this.frameBuf = buf(96 + MAX_LIGHTS * 48, SU.UNIFORM | SU.COPY_DST);
+    this.viewBuf = buf(16, SU.UNIFORM | SU.COPY_DST);
     this.jobsBuf = buf(MAX_LIGHTS * S.JOB * 16, ST);
     this.bandU = buf(32, SU.UNIFORM | SU.COPY_DST);
     this.bandWords = new Uint32Array(8);
@@ -169,7 +170,7 @@ export class NRPEngine extends EngineBase {
     });
     this.bgFwdSub = bg(pFwd, 0, [this.wBuf, this.xBuf, this.jobsSubBuf, this.fwdSubU, this.subIdxBuf, this.pgeoBuf, this.subOutBuf]);
     this.bgComp = bg(pComp, 0, [this.frameBuf, this.outBuf, this.pgeoBuf, this.refBuf, this.dispBuf, this.hdrBuf]);
-    this.bgBlit = bg(pBlit, 0, [this.dispBuf]);
+    this.bgBlit = bg(pBlit, 0, [this.dispBuf, this.viewBuf]);
     this.bgLoss = bg(pLoss, 0, [this.frameBuf, this.optU, this.subIdxBuf, this.subOutBuf, this.tgtBuf, this.pgeoBuf, this.dLdIBuf, this.subDirBuf]);
     this.bgGrad0 = bg(pGrad, 0, [this.wBuf, this.xBuf, this.jobsSubBuf, this.fwdSubU, this.subIdxBuf, this.pgeoBuf]);
     this.bgGrad1 = bg(pGrad, 1, [this.frameBuf, this.optU, this.dLdIBuf, this.subOutBuf, this.subDirBuf, this.scrBuf, this.partBuf]);
@@ -377,12 +378,14 @@ export class NRPEngine extends EngineBase {
     pass.dispatchWorkgroups(Math.ceil(this.NP / 64));
     pass.end();
     dev.queue.submit([enc.finish()]);
+    this.composited = true;
     this.present();
   }
 
-  /** Draws the last composited image to the canvas. */
+  /** Draws the last composited image to the canvas, at the canvas's size. */
   present() {
     const dev = this.device;
+    dev.queue.writeBuffer(this.viewBuf, 0, new Float32Array([this.canvas.width, this.canvas.height, 0, 0]));
     const enc = dev.createCommandEncoder();
     const rp = enc.beginRenderPass({
       colorAttachments: [{ view: this.ctx.getCurrentTexture().createView(), loadOp: "clear", storeOp: "store", clearValue: [0, 0, 0, 1] }],
