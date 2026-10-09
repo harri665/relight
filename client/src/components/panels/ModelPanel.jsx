@@ -1,14 +1,30 @@
 import { useRelighter } from '../../relight/useRelighter.js'
+import { AUTO } from '../../relight/relighter.js'
+import { previewStride, refineStride } from '../../relight/quality.js'
 import { fmt } from '../../relight/color.js'
+import BrowserSupport from './BrowserSupport.jsx'
+
+const ordinal = (n) => `${n}${n === 2 ? 'nd' : n === 3 ? 'rd' : 'th'}`
+const every = (s) => (s <= 1 ? 'every pixel' : `every ${ordinal(s)} pixel`)
+// WebGPU: '<threads>x<pixels>', WebGL: 'o<output groups a pass>'
+function kernelText(name) {
+  const gpu = /^(\d+)x(\d+)$/.exec(name), gl = /^o(\d+)$/.exec(name)
+  if (gpu) return `${gpu[1]} threads a workgroup, ${gpu[2]} pixels each`
+  if (gl) return `${gl[1]} output group${gl[1] === '1' ? '' : 's'} a pass`
+  return name
+}
 
 function Table({ rows }) {
   return (
     <table className="w-full border-collapse text-xs">
       <tbody>
-        {rows.map(([k, v]) => (
-          <tr key={k} className="border-b border-line">
-            <td className="py-0.5 text-dim">{k}</td>
-            <td className="py-0.5 text-right">{v}</td>
+        {rows.map(([k, v, note]) => (
+          <tr key={k} className="border-b border-line align-top">
+            <td className="py-0.5 pr-2 text-dim">{k}</td>
+            <td className="py-0.5 text-right">
+              {v}
+              {note && <div className="text-dim">{note}</div>}
+            </td>
           </tr>
         ))}
       </tbody>
@@ -48,14 +64,33 @@ export default function ModelPanel() {
             : []),
         ]}
       />
-      <h3 className="mt-4 mb-1 font-bold">Viewer</h3>
-      <Table
-        rows={[
-          ['image', `${r.W} × ${r.H}`],
-          ['backend', engine.backend],
-          ['time per light (full res)', r.stats.perLight ? `${fmt(r.stats.perLight, 1)} ms` : '–'],
-        ]}
-      />
+      <h3 className="mt-4 mb-1 font-bold">Renderer</h3>
+      <Renderer r={r} />
+      <BrowserSupport />
     </>
   )
+}
+
+/** How the viewer runs on this device, live: what quality.js has settled on so far. */
+function Renderer({ r }) {
+  const { engine, quality } = r
+  const cost = engine.evalCost(1), budget = quality.budget
+  const { frames, late } = quality.stats
+  const gpu = engine.backend === 'WebGPU'
+  const rows = [
+    ['backend', gpu ? 'WebGPU (compute shaders)' : 'WebGL2 (fragment passes)', !gpu && r.notGPU ? `as ${r.notGPU}` : null],
+    ['precision', engine.precision],
+    ['image', `${r.W} × ${r.H}${AUTO ? ', sized to this GPU' : ''}`,
+      r.swapping ? `loading ${r.swapping.name} at ${r.swapping.res ?? 'its native size'} on ${r.swapping.backend}` : null],
+    ['GPU', r.stats.gpu],
+    ['kernel', `${kernelText(engine.kernelName)}${engine.tuned ? '' : ' (untuned)'}`],
+    ['one light, every pixel', cost === null ? 'measuring…' : `${fmt(cost, 1)} ms`, engine.timing.seeded ? 'from an earlier visit' : null],
+    ['network budget', `${fmt(budget, 1)} ms a frame`],
+    ['moving light', every(previewStride(engine, budget))],
+    ['resting light', `refined to ${every(refineStride(engine, budget))}`],
+    ['display', `${engine.canvas.width} × ${engine.canvas.height} px, Catmull-Rom upscaled`],
+    ['frames held 30 fps', frames ? `${fmt(100 - (100 * late) / frames, 1)} %` : '–'],
+    ['settings', r.fromProfile ? 'tuned on an earlier visit' : 'being tuned on this visit'],
+  ]
+  return <Table rows={rows} />
 }
