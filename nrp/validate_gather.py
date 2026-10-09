@@ -15,7 +15,7 @@ from denoise import Denoiser  # noqa: E402
 
 
 def reference(scene_name, res, light, max_depth, spp):
-    d = scenes.SCENES[scene_name]["build"](res)
+    d, _ = scenes.build(scene_name, res)
     if not isinstance(d, dict):
         # XML scene: include it next to the extra light, so its relative asset paths still resolve.
         x, y, z, r = light
@@ -47,9 +47,7 @@ def main():
     den = Denoiser(pd.aux[..., 0:3].cpu().numpy(), pd.aux[..., 3:6].cpu().numpy())
     out = WORK_DIR / "validate" / args.scene
     out.mkdir(exist_ok=True, parents=True)
-    lights = scenes.SCENES[args.scene]["test_lights"][:3]
-    if args.scene == "cornell":  # the lights this check was originally run with
-        lights = [[0.0, 0.6, 0.0, 0.2], [-0.5, -0.2, 0.5, 0.1], [0.3, 0.3, 1.5, 0.3]]
+    lights = [[0.0, 0.6, 0.0, 0.2], [-0.5, -0.2, 0.5, 0.1], [0.3, 0.3, 1.5, 0.3]] if args.scene == "cornell" else         (scenes.config(meta).get("test_lights") or [])[:3] or         [[a + (b - a) * f for a, b in zip(*meta["light_bbox"])] + [0.15] for f in (0.3, 0.5, 0.7)]
     for i, light in enumerate(lights):
         g = pd.gather(torch.tensor(light))[0].cpu().numpy()
         ref = reference(args.scene, meta["width"], light, meta["max_seg"], args.spp)

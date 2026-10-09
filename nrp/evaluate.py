@@ -28,14 +28,14 @@ from gather import PathData, gather_arrays
 from model import NRP, PixelBuffers, predict_image
 
 def eval_lights(meta, n, seed):
-    """The scene's viewer test lights followed by n random ones."""
+    """The scene's viewer test lights (if it defines any) followed by n random ones."""
     g = torch.Generator().manual_seed(seed)
     lo, hi = torch.tensor(meta["light_bbox"][0]), torch.tensor(meta["light_bbox"][1])
     rmin, rmax = meta["radius_range"]
     c = lo + (hi - lo) * torch.rand(n, 3, generator=g)
     r = rmin + (rmax - rmin) * torch.rand(n, 1, generator=g)
-    tests = torch.tensor(scenes.SCENES[meta["scene"]]["test_lights"])
-    return torch.cat([tests, torch.cat([c, r], -1)]).cuda()
+    tests = torch.tensor(scenes.config(meta).get("test_lights") or [], dtype=torch.float32).reshape(-1, 4)
+    return torch.cat([tests, torch.cat([c, r], -1)]).cuda(), len(tests)
 
 
 @torch.no_grad()
@@ -74,15 +74,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scene", default="cornell")
     ap.add_argument("--runs", nargs="*", default=[])
-    ap.add_argument("--n", type=int, default=32, help="random lights (plus the 6 viewer tests)")
+    ap.add_argument("--n", type=int, default=32, help="random lights (plus the scene's viewer tests)")
     ap.add_argument("--ref-spp", type=int, default=1024)
     ap.add_argument("--seed", type=int, default=2024)
     args = ap.parse_args()
 
     meta = load_meta(args.scene)
     aux = torch.from_numpy(np.load(scene_dir(args.scene) / "aux.npy")).cuda()
-    meta["depth_scale"] = float(aux[..., 9].max())
-    lights = eval_lights(meta, args.n, args.seed)
+    meta["depth_scale"] = min(float(aux[..., 9].max()), meta.get("far", 40.0))
+    lights, n_tests = eval_lights(meta, args.n, args.seed)
     den = make_denoiser(aux[..., 0:3], aux[..., 3:6])
     H, W = meta["height"], meta["width"]
     NP = H * W
@@ -100,6 +100,7 @@ def main():
     keep = [i for i in range(len(lights)) if ref[i].mean() > 1e-5]
     print(f"{len(lights) - len(keep)} of {len(lights)} lights are inside geometry and skipped")
     lights, ref, directs = lights[keep], ref[keep], [directs[i] for i in keep]
+    n_tests = sum(i < n_tests for i in keep)
 
     results = {}
     # Supervision quality: denoised gather of the stored dump (what training sees).
@@ -117,13 +118,14 @@ def main():
         bufs = PixelBuffers(aux, ck["meta"], aux_dim=ck["cfg"].get("aux_dim", 7))
         results[run] = [metrics(predict_image(model, bufs, l) + d, r) for l, d, r in zip(lights, directs, ref)]
 
-    print(f"\n{'':44s} {'PSNR all':>9s} {'viewer tests 1..6 (dB)':>40s} {'rel.MAE':>8s} {'worst 5 mean':>13s}"
+    head = f"viewer tests 1..{n_tests} (dB)" if n_tests else ""
+    print(f"\n{'':44s} {'PSNR all':>9s} {head:>40s} {'rel.MAE':>8s} {'worst 5 mean':>13s}"
           f" {'dark rel.MAE':>13s} {'PSNR +3EV':>10s}")
     summary = {}
     for name, m in results.items():
         p = np.array([x[0] for x in m]); e = np.array([x[1] for x in m])
         ed = np.array([x[2] for x in m]); p8 = np.array([x[3] for x in m])
-        tests = " ".join(f"{x:5.1f}" for x in p[:6])  # all six viewer tests are valid lights
+        tests = " ".join(f"{x:5.1f}" for x in p[:n_tests])
         worst = np.sort(p)[:5].mean()
         print(f"{name:44s} {p.mean():8.2f}  {tests:>40s} {100 * e.mean():7.1f}% {worst:12.2f}"
               f" {100 * ed.mean():12.1f}% {p8.mean():10.2f}")

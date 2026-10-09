@@ -65,7 +65,7 @@ The Python pipeline needs an NVIDIA GPU with CUDA. Large files (the virtual envi
 ```bash
 python -m venv %USERPROFILE%\relight-work\venv
 pip install torch --index-url https://download.pytorch.org/whl/cu124
-pip install mitsuba numpy pillow "triton-windows<3.3" oidn
+pip install mitsuba numpy pillow "triton-windows<3.3" oidn usd-core
 ```
 
 Optional but about 20× faster data generation: unpack the [OIDN 2.x Windows release](https://github.com/RenderKit/oidn/releases) into `%USERPROFILE%\relight-work`, or set `OIDN_DIR`.
@@ -83,11 +83,56 @@ The same steps with `--scene bathroom` build the bathroom ('Contemporary Bathroo
 
 Exports store their per-pixel buffers packed (16-bit positions, each row as differences), which gzip shrinks about 4.5x more than the old float layout. An export from before this can be repacked in place with `python pixels.py <web scene folder>`; the viewer reads both.
 
+## Your own scene (USD)
+
+Any USD stage (`.usd`, `.usda`, `.usdc`, `.usdz`) can replace the Cornell box. Pass the file to
+`sample_paths.py`, and use the id it prints (the file name without extension, or `--name`) as the
+scene for the other steps:
+
+```
+python sample_paths.py --scene D:\assets\kitchen.usdz --name kitchen [--camera /World/Cam]
+python train.py --scene kitchen --geo --head mul --width 128 --hidden 4 --iters 100000
+python export.py --run kitchen_128x4 --label "Kitchen · fast (128×4)"
+```
+
+The model then appears in the viewer's model menu (or open `?scene=kitchen`).
+
+`nrp/examples/caustics_still_life.py` builds an example stage in code: glassware in a plaster niche, made to show off
+caustics. Its docstring gives the settings it needs: more bounces for the wine glass, and smaller lights for sharper caustics.
+
+What the import does (`usd_scene.py`):
+
+- **Camera.** It uses the camera named with `--camera`, or else the first camera in the stage. Without a camera it frames all
+  geometry from a three-quarter view. The image is square, so a wide camera is cropped to its smaller field of view.
+- **Units and scale.** The stage is converted to Y-up, then moved and scaled so that the region the camera sees spans
+  about [-1, 1]. The network's inputs, the light radius range and the path storage expect that scale. Light positions in the viewer are
+  in these coordinates; `meta.json` records the transform (`normalize`) to map them back to the stage.
+- **Light domain.** By default the lights live in the visible region. For enclosed scenes it is pulled in slightly, and when many camera rays
+  escape (an object on a ground plane, say) it is grown by 0.3 so lights can go above and around things. The import prints it. Override it with
+  `--light-bbox x0 y0 z0 x1 y1 z1` (normalised coordinates), `--light-margin` or `--radius-range`.
+- **Geometry.** Meshes (polygons, holes, GeomSubsets with their own materials, vertex or faceVarying normals and UVs),
+  the implicit Sphere, Cube, Cylinder, Cone, Capsule and Plane, native instances and PointInstancers are all imported. Subdivision surfaces
+  render as their control cage. Invisible prims, guides and proxies are skipped, and so are curves, points and volumes.
+- **Materials.** UsdPreviewSurface is converted in full: constant or textured colour, roughness, metallic and opacity, UsdTransform2d,
+  normal maps, alpha cutouts (`opacityThreshold`), and glass (low opacity plus `ior`). MaterialX standard_surface / OpenPBR and OmniPBR / OmniGlass
+  only get their constant values. Anything else falls back to `displayColor`. Emission is ignored, because the virtual lights are the only lights.
+  Textures larger than `--max-texture` (2048) are downsampled.
+- **Lights.** UsdLux lights don't take part in training, but sphere, disk, rect and cylinder lights become the viewer's starting lights
+  (non-sphere ones as spheres of the same area). They keep their colours and relative intensities and are scaled for a good exposure.
+  Without such lights, `export.py` picks a warm key and a cool fill that light the view well. It also picks the test lights for the Accuracy tab.
+
+The import prints a summary and notes on anything it approximated or skipped. Check those first when something looks off.
+
+The paper's limitations apply here too: one static stage, one camera, and sphere lights inside the light domain. Large, open or highly
+detailed scenes spread the same network over more variation, so expect lower accuracy than on the Cornell box.
+Keep the light domain tight, or train longer or wider.
+
 ## Project layout
 
 ```
 nrp/                        Python: data generation and training (PyTorch, Mitsuba 3, Triton, OIDN)
   scenes.py                 emitter-free scenes and the light domain
+  usd_scene.py              any USD stage as an emitter-free Mitsuba scene (see "Your own scene")
   sample_paths.py           SAMPLEPATHS: light-agnostic path dump
   gather.py                 GATHERLIGHT: fused Triton kernel for sphere lights
   direct.py                 analytic direct-view term

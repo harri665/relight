@@ -5,7 +5,8 @@ import { NRPEngine, GLEngine, LightOptimizer, MAX_LIGHTS, discPixels } from "../
 import { hexToRgb, rgbToHex, srgbToLin, fmt } from "./color.js";
 
 const params = new URLSearchParams(location.search);
-export const SCENE = params.get("scene") || "cornell";
+// Without ?scene=, the first load picks "cornell" or else the first scene in the index (see resolveScene).
+export let SCENE = params.get("scene") || "";
 export const BACKEND = params.get("backend");  // "webgpu" or "webgl" forces one
 export const RES = Number(params.get("res")) || null;  // alternative image size, see export.py --res
 export { MAX_LIGHTS };
@@ -19,6 +20,19 @@ const FRAME_BUDGET_MS = 30, REFINE_MS = 150;
 // Engines own the canvas context, so switching backend or scene reloads the page. Lights, exposure
 // and selection are carried over in sessionStorage so both backends can be compared on the same lighting.
 const CARRY_KEY = "nrp-carry";
+
+// Starting lights for scenes exported before scene.json listed its own.
+const FALLBACK_LIGHTS = [
+  { name: "Key", pos: [0.1, 0.8, 0.1], radius: 0.12, color: [1, 0.86, 0.68], intensity: 18 },
+  { name: "Fill", pos: [-0.72, 0.15, 0.75], radius: 0.09, color: [0.6, 0.75, 1], intensity: 10 },
+];
+
+async function resolveScene() {
+  if (SCENE) return;
+  let index = [];
+  try { index = await (await fetch("/scenes/index.json")).json(); } catch { /* fall through to cornell */ }
+  SCENE = index.some((s) => s.name === "cornell") ? "cornell" : index[0]?.name ?? "cornell";
+}
 
 export const HELP_HINT = "drag lights · wheel = depth · shift+wheel = radius · double-click a surface to place";
 
@@ -102,6 +116,7 @@ class Relighter {
 
   /** WebGPU first, then WebGL2. Returns the first backend that loads the scene. */
   async startEngine(setMsg) {
+    await resolveScene();
     const failed = [];
     for (const [name, Engine] of [["WebGPU", NRPEngine], ["WebGL2", GLEngine]]) {
       if (BACKEND && !name.toLowerCase().startsWith(BACKEND.toLowerCase())) continue;
@@ -239,11 +254,7 @@ class Relighter {
   }
 
   defaultLights() {
-    if (this.scene?.default_lights) return this.setLights(this.scene.default_lights);
-    this.setLights([
-      { name: "Key", pos: [0.1, 0.8, 0.1], radius: 0.12, color: [1, 0.86, 0.68], intensity: 18 },
-      { name: "Fill", pos: [-0.72, 0.15, 0.75], radius: 0.09, color: [0.6, 0.75, 1], intensity: 10 },
-    ]);
+    this.setLights(this.scene.default_lights ?? FALLBACK_LIGHTS);
   }
   randomLights() {
     const { rmin, rmax } = this.engine;
@@ -675,7 +686,7 @@ class Relighter {
     if (this.ready) {
       try {
         sessionStorage.setItem(CARRY_KEY, JSON.stringify({
-          scene: SCENE, bbox: this.scene.light_bbox, sel: this.state.sel, exposure: this.ui.exposure,
+          scene: SCENE, family: this.sceneFamily(), sel: this.state.sel, exposure: this.ui.exposure,
           lights: this.state.lights.map(({ name, pos, radius, color, intensity, enabled }) => ({ name, pos, radius, color, intensity, enabled })),
         }));
       } catch { /* storage unavailable: switch without carrying state */ }
@@ -684,12 +695,15 @@ class Relighter {
     for (const [k, v] of Object.entries(changes)) (v ? q.set(k, v) : q.delete(k));
     location.search = q.toString();
   }
+  sceneFamily() {
+    const { scene } = this;
+    return scene.source_scene ?? JSON.stringify([scene.camera.to_world, scene.light_bbox]);
+  }
   restoreCarried() {
     let c = null;
     try { c = JSON.parse(sessionStorage.getItem(CARRY_KEY)); sessionStorage.removeItem(CARRY_KEY); } catch { return false; }
-    if (!c?.lights?.length) return false;
-    // Lights only carry over between models of the same scene (another network size or backend).
-    if (JSON.stringify(c.bbox) !== JSON.stringify(this.scene.light_bbox)) return false;
+    // Lights only mean the same thing in exports of the same scene (e.g. another network or size).
+    if (!c?.lights?.length || c.family !== this.sceneFamily()) return false;
     this.setLights(c.lights);
     this.state.sel = Math.min(c.sel ?? 0, this.state.lights.length - 1);
     this.setExposure(c.exposure ?? 0);
