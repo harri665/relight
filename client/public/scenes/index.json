@@ -1,5 +1,14 @@
 [
  {
+  "name": "cornell-lite",
+  "label": "Cornell \u00b7 lite (64\u00d74)",
+  "network": "64x4",
+  "tiers": [
+   384,
+   768
+  ]
+ },
+ {
   "name": "cornell",
   "label": "Cornell \u00b7 fast (128\u00d74)",
   "network": "128x4",
@@ -11,6 +20,31 @@
  {
   "name": "cornell-hq",
   "label": "Cornell \u00b7 quality (256\u00d74)",
+  "network": "256x4"
+ },
+ {
+  "name": "bathroom",
+  "label": "Bathroom \u00b7 fast (128\u00d74)",
+  "network": "128x4"
+ },
+ {
+  "name": "bathroom-hq",
+  "label": "Bathroom \u00b7 quality (256\u00d74)",
+  "network": "256x4"
+ },
+ {
+  "name": "still_life",
+  "label": "Caustics still life \u00b7 rough (128\u00d74)",
+  "network": "128x4"
+ },
+ {
+  "name": "flooded_canoe_cave",
+  "label": "Flooded canoe cave \u00b7 fast (128\u00d74)",
+  "network": "128x4"
+ },
+ {
+  "name": "flooded_canoe_cave-hq",
+  "label": "Flooded canoe cave \u00b7 quality (256\u00d74)",
   "network": "256x4"
  }
 ]
